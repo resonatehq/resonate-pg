@@ -4,7 +4,7 @@
 
 **Dead simple durable execution.**
 
-Resonate durable execution runs your code as a reliable workflow, checkpointing each step as a durable promise, sleeping for days, surviving crashes and restarts. resonate-pg is one SQL file. No servers, no queues, no timer. Full Resonate docs live at [docs.resonatehq.io](https://docs.resonatehq.io).
+Resonate durable execution runs your code as a reliable workflow, checkpointing each step as a durable promise, sleeping for days, surviving crashes and restarts. resonate-pg is one SQL file. No server process, no message broker, no timer service — Postgres, with pg_cron, is all three. Full Resonate docs live at [docs.resonatehq.io](https://docs.resonatehq.io).
 
 ```ts
 resonate.register(
@@ -33,10 +33,10 @@ resonate-pg is a Resonate Server in a single file running on Postgres 16+:
 psql -d yourdb -f resonate.sql
 ```
 
-**Extension**
+**Extensions**
 
-- pg_cron *(required)*
-- pg_net *(optional)*
+- pg_cron *(required — drives all timers; without it nothing fires)*
+- pg_net *(required for HTTP delivery — e.g. Edge Functions; pull-based workers work without it)*
 
 ## SDK
 

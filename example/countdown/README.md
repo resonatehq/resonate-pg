@@ -36,14 +36,16 @@ Open the **SQL Editor** in your Supabase dashboard, paste the entire contents of
 [`resonate.sql`](../../resonate.sql), and run it. (Or from your machine:
 `psql "$YOUR_DB_CONNECTION_STRING" -f resonate.sql`.)
 
-That's the whole server: one `resonate` schema, nothing else touched. Verify
-it's alive — this asks the server for a promise that doesn't exist yet:
+That's the whole server: one `resonate` schema, a `resonate_worker` role, and
+one pg_cron job — nothing else touched. Verify it's alive — this asks the
+server for a promise that doesn't exist yet:
 
 ```sql
 select resonate.resonate_rpc('{"kind":"promise.get","head":{},"data":{"id":"hello"}}');
 ```
 
-You should get back a response with `"status": 404` — the server is answering.
+You should get back a response with `"status": 404` in its `head` — the server
+is answering.
 
 Then check the timer is ticking:
 
@@ -51,9 +53,18 @@ Then check the timer is ticking:
 select jobname, schedule from cron.job where jobname = 'resonate_process_timeouts';
 ```
 
-One row (`5 seconds`) means timers drive themselves. **No row?** Enable the
+One row (`5 seconds`) means timers drive themselves. On pg_cron older than 1.5
+the schedule reads `* * * * *` instead — timers tick once a minute rather than
+every five seconds, and everything still works. **No row?** Enable the
 **pg_cron** extension (Dashboard → Database → Extensions) and run `resonate.sql`
 again — re-running is always safe.
+
+One more check: **pg_net** is what lets the database call your function back.
+Make sure it's enabled too (same Extensions page):
+
+```sql
+select count(*) from pg_extension where extname = 'pg_net';
+```
 
 ## Step 2 — Deploy the function
 
@@ -128,20 +139,21 @@ from resonate.promises where id = 'countdown-demo';
 
 `"liftoff"` 🚀
 
-Run it again with `'args':[10000]` and it will tick for close to three hours —
-thousands of invocations, each a few milliseconds of compute, none of them
-anywhere near a timeout.
+Run it again with `'args':[10000]` — and a `timeoutAt` to match, say
+`+ 4 * 3600000` (four hours) instead of `+ 600000` — and it will tick for close
+to three hours: thousands of invocations, each a few milliseconds of compute,
+none of them anywhere near a timeout.
 
 ## What just happened
 
-- `ctx.run(...)` executed a step and **saved its result** as a row. Saved steps
-  are never re-executed — that's why each number logs exactly once even though
-  the function was invoked many times.
-- `ctx.sleep(1000)` wrote a deadline and **suspended** the workflow. No process
-  waited. pg_cron fired the timer; pg_net called the function back; a fresh
+- `ctx.run(...)` executed a step and saved its result as a row. Saved steps are
+  never re-executed, which is why each number logs exactly once even though the
+  function was invoked many times.
+- `ctx.sleep(1000)` wrote a deadline and suspended the workflow. No process
+  waited: pg_cron fired the timer, pg_net called the function back, and a fresh
   invocation skipped the saved steps and ran the next one.
-- Because every step is saved, the workflow also survives crashes, redeploys,
-  and restarts — it continues from the last saved step, never from zero.
+- Every step is saved, so the workflow also survives crashes, redeploys, and
+  restarts. It continues from the last saved step, never from zero.
 
 That's durable execution, on nothing but your Supabase Postgres. The
 [main README](../../README.md) has the full picture: how it works, operations,

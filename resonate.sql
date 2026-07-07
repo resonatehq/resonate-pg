@@ -138,8 +138,10 @@ CREATE OR REPLACE FUNCTION _outbox_http_body(o outbox) RETURNS jsonb LANGUAGE sq
 $$;
 
 -- Delivery by address scheme:
---   http(s) -> PUSH: net.http_post after commit, then delete (lost push -> retry
---     timer re-emits; no pg_net -> row left undelivered).
+--   http(s) -> PUSH: net.http_post (async: pg_net queues and delivers later),
+--     then delete. A lost execute push is re-emitted by the retry timer; a lost
+--     unblock push is NOT re-sent -- http listener delivery is best-effort.
+--     No pg_net -> row left undelivered.
 --   else -> PULL: NOTIFY the address's channel (a missed NOTIFY is harmless).
 CREATE OR REPLACE FUNCTION _notify_outbox() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -256,7 +258,7 @@ BEGIN
   IF NOT FOUND THEN RETURN; END IF;
 
   IF t.state = 'suspended' THEN
-    UPDATE tasks SET state = 'pending', pid = pid, ttl = ttl,
+    UPDATE tasks SET state = 'pending',
                      timeout_at = now + _retry_timeout() WHERE id = t.id;
     DELETE FROM task_resumes WHERE task_id = t.id;
     INSERT INTO task_resumes (task_id, awaited_id) VALUES (t.id, p_awaited)
@@ -327,6 +329,7 @@ BEGIN
       step := split_part(part, '/', 2);
     END IF;
     s := step::int;
+    IF s < 1 THEN RAISE EXCEPTION 'invalid cron step: %', spec; END IF;
     IF rng = '*' THEN
       a := lo; b := hi;
     ELSIF position('-' in rng) > 0 THEN
@@ -360,20 +363,32 @@ BEGIN
   dom_star := (f[3] = '*'); dow_star := (f[5] = '*');
 
   ts := date_trunc('minute', to_timestamp(after / 1000.0) AT TIME ZONE 'UTC') + interval '1 minute';
-  cutoff := ts + interval '366 days' + interval '1 day';
+  -- Horizon: 9 years covers the longest gap a 5-field cron can produce -- Feb 29
+  -- fires 2096 -> 2104 across the non-leap century year 2100. Non-matching months
+  -- and days are skipped in one step, so the walk is a few thousand iterations
+  -- at worst, not minute-by-minute across years.
+  cutoff := ts + interval '9 years';
   WHILE ts < cutoff LOOP
+    IF NOT (extract(month from ts)::int = ANY(mons)) THEN
+      ts := date_trunc('month', ts) + interval '1 month';
+      CONTINUE;
+    END IF;
     dow := extract(dow from ts)::int;  -- 0=Sun..6=Sat
-    IF extract(month  from ts)::int = ANY(mons)
-       AND extract(hour   from ts)::int = ANY(hrs)
-       AND extract(minute from ts)::int = ANY(mins) THEN
-      IF dom_star AND dow_star THEN ok := true;
-      ELSIF dom_star THEN ok := dow = ANY(dows);
-      ELSIF dow_star THEN ok := extract(day from ts)::int = ANY(doms);
-      ELSE ok := extract(day from ts)::int = ANY(doms) OR dow = ANY(dows);
-      END IF;
-      IF ok THEN
-        RETURN (extract(epoch from ts) * 1000)::bigint;
-      END IF;
+    IF dom_star AND dow_star THEN ok := true;
+    ELSIF dom_star THEN ok := dow = ANY(dows);
+    ELSIF dow_star THEN ok := extract(day from ts)::int = ANY(doms);
+    ELSE ok := extract(day from ts)::int = ANY(doms) OR dow = ANY(dows);
+    END IF;
+    IF NOT ok THEN
+      ts := date_trunc('day', ts) + interval '1 day';
+      CONTINUE;
+    END IF;
+    IF NOT (extract(hour from ts)::int = ANY(hrs)) THEN
+      ts := date_trunc('hour', ts) + interval '1 hour';
+      CONTINUE;
+    END IF;
+    IF extract(minute from ts)::int = ANY(mins) THEN
+      RETURN (extract(epoch from ts) * 1000)::bigint;
     END IF;
     ts := ts + interval '1 minute';
   END LOOP;
@@ -416,6 +431,7 @@ DECLARE
   pd text  := p_param->>'data';
   tags jsonb := COALESCE(p_tags, '{}'::jsonb);
 BEGIN
+  IF p_id IS NULL OR p_timeout_at IS NULL THEN RETURN jsonb_build_object('status', 400); END IF;
   PERFORM _lock(p_id);
   SELECT * INTO p FROM promises WHERE id = p_id FOR UPDATE;
   IF FOUND THEN
@@ -566,6 +582,9 @@ DECLARE
   a_tags jsonb := COALESCE(p_action->'tags', '{}'::jsonb);
   p promises; t tasks; st text;
 BEGIN
+  IF a_id IS NULL OR a_to IS NULL OR p_pid IS NULL OR p_ttl IS NULL THEN
+    RETURN jsonb_build_object('status', 400);
+  END IF;
   PERFORM _lock(a_id);
   SELECT * INTO p FROM promises WHERE id = a_id FOR UPDATE;
 
@@ -615,6 +634,7 @@ CREATE OR REPLACE FUNCTION task_acquire(
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE t tasks; p promises;
 BEGIN
+  IF p_pid IS NULL OR p_ttl IS NULL THEN RETURN jsonb_build_object('status', 400); END IF;
   PERFORM _lock(p_id);
   SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
@@ -623,7 +643,7 @@ BEGIN
 
   IF t.state <> 'pending' THEN RETURN jsonb_build_object('status', 409); END IF;
   IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version <> p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
 
   DELETE FROM task_resumes WHERE task_id = t.id;
   UPDATE tasks SET state = 'acquired', version = version + 1, ttl = p_ttl, pid = p_pid,
@@ -647,7 +667,7 @@ BEGIN
 
   IF t.state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
   IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version <> p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
 
   IF kind = 'create' THEN
     r := promise_create(req->>'id', (req->>'timeoutAt')::bigint,
@@ -704,7 +724,7 @@ BEGIN
 
   IF t.state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
   IF tp.state <> 'pending' OR tp.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version <> p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
 
   -- validate awaiteds: any missing -> 422; any already settled/expired -> 300
   SELECT count(*) FILTER (WHERE pa.id IS NULL),
@@ -746,7 +766,7 @@ BEGIN
 
   IF t.state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
   IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version <> p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
 
   UPDATE promises SET state = p_action->>'state', value_headers = vh, value_data = vd,
                       settled_at = p_now
@@ -768,11 +788,13 @@ BEGIN
 
   IF t.state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
   IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version <> p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
 
   UPDATE tasks SET state = 'pending', pid = NULL, ttl = NULL,
                    timeout_at = p_now + _retry_timeout() WHERE id = t.id;
-  PERFORM _emit_execute(COALESCE(p.target, ''), t.id, t.version);
+  IF p.target IS NOT NULL AND p.target <> '' THEN
+    PERFORM _emit_execute(p.target, t.id, t.version);
+  END IF;
   RETURN jsonb_build_object('status', 200);
 END $$;
 
@@ -804,7 +826,9 @@ BEGIN
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
 
   UPDATE tasks SET state = 'pending', timeout_at = p_now + _retry_timeout() WHERE id = t.id;
-  PERFORM _emit_execute(COALESCE(p.target, ''), t.id, t.version);
+  IF p.target IS NOT NULL AND p.target <> '' THEN
+    PERFORM _emit_execute(p.target, t.id, t.version);
+  END IF;
   RETURN jsonb_build_object('status', 200);
 END $$;
 
@@ -835,13 +859,21 @@ CREATE OR REPLACE FUNCTION schedule_create(
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE s schedules; nxt bigint;
 BEGIN
+  IF p_id IS NULL OR p_cron IS NULL OR p_promise_id IS NULL OR p_promise_timeout IS NULL THEN
+    RETURN jsonb_build_object('status', 400);
+  END IF;
   PERFORM _lock('sched:' || p_id);
   SELECT * INTO s FROM schedules WHERE id = p_id FOR UPDATE;
   IF FOUND THEN
     RETURN jsonb_build_object('status', 200, 'schedule', _schedule_json(s));
   END IF;
 
-  nxt := _next_cron(p_cron, p_now);
+  -- an unparseable cron (or one that never fires) is a client error, not a crash
+  BEGIN
+    nxt := _next_cron(p_cron, p_now);
+  EXCEPTION WHEN OTHERS THEN
+    RETURN jsonb_build_object('status', 400);
+  END;
   INSERT INTO schedules (id, cron, promise_id, promise_timeout,
                          promise_param_headers, promise_param_data, promise_tags,
                          created_at, next_run_at, last_run_at)
@@ -904,7 +936,9 @@ BEGIN
   UPDATE tasks SET timeout_at = p_now + _retry_timeout() WHERE id = t.id;
   SELECT * INTO p FROM promises WHERE id = t.id;
   IF NOT FOUND THEN RETURN; END IF;
-  PERFORM _emit_execute(COALESCE(p.target, ''), t.id, t.version);
+  IF p.target IS NOT NULL AND p.target <> '' THEN
+    PERFORM _emit_execute(p.target, t.id, t.version);
+  END IF;
 END $$;
 
 -- task lease timeout (kind 1): reclaim an abandoned acquired task ------------
@@ -921,7 +955,9 @@ BEGIN
                    timeout_at = p_now + _retry_timeout() WHERE id = t.id;
   SELECT * INTO p FROM promises WHERE id = t.id;
   IF NOT FOUND THEN RETURN; END IF;
-  PERFORM _emit_execute(COALESCE(p.target, ''), t.id, t.version);
+  IF p.target IS NOT NULL AND p.target <> '' THEN
+    PERFORM _emit_execute(p.target, t.id, t.version);
+  END IF;
 END $$;
 
 -- schedule timeout: fire (and catch up) a due schedule ----------------------
@@ -1045,7 +1081,7 @@ BEGIN
     WHEN 'task.create'               THEN jsonb_build_object('task', r->'task', 'promise', r->'promise', 'preload', '[]'::jsonb)
     WHEN 'task.acquire'              THEN jsonb_build_object('task', r->'task', 'promise', r->'promise', 'preload', '[]'::jsonb)
     WHEN 'task.fulfill'              THEN jsonb_build_object('promise', r->'promise')
-    WHEN 'task.suspend'              THEN CASE WHEN status = 300 THEN jsonb_build_object('preload', '[]'::jsonb) ELSE '{}'::jsonb END
+    WHEN 'task.suspend'              THEN jsonb_build_object('preload', '[]'::jsonb)
     WHEN 'schedule.get'              THEN jsonb_build_object('schedule', r->'schedule')
     WHEN 'schedule.create'           THEN jsonb_build_object('schedule', r->'schedule')
     -- task.release / task.halt / task.continue / task.heartbeat / schedule.delete
@@ -1162,6 +1198,13 @@ BEGIN
     'data', data);
    EXCEPTION WHEN deadlock_detected THEN
      IF _attempt >= 50 THEN RAISE; END IF;   -- exhausted retries: surface it
+   WHEN OTHERS THEN
+     -- never leak a raw SQL exception through the wire: malformed input (bad
+     -- casts, unexpected shapes) comes back as a clean 500 envelope
+     RETURN jsonb_build_object(
+       'kind', kind,
+       'head', jsonb_build_object('corrId', corr, 'status', 500, 'version', ver),
+       'data', to_jsonb(SQLERRM));
    END;
   END LOOP;
 END $$;
@@ -1281,6 +1324,11 @@ CREATE OR REPLACE FUNCTION gc(p_settled_before bigint, p_limit int DEFAULT 10000
   unb AS (
     DELETE FROM outbox
     WHERE kind = 'unblock' AND promise->>'id' IN (SELECT id FROM del)
+    RETURNING 1),
+  res AS (
+    -- buffered resume triggers pointing at a collected promise (task_id FK only
+    -- covers the awaiter side; the awaited side must be scrubbed here)
+    DELETE FROM task_resumes WHERE awaited_id IN (SELECT id FROM del)
     RETURNING 1)
   SELECT count(*) FROM del;
 $$;
@@ -1290,7 +1338,9 @@ $$;
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Lock EXECUTE (default PUBLIC) to one worker role. The wire entrypoints are
 -- SECURITY DEFINER (run as owner) so the procedures are the sole path to state;
--- everything else (DDL, gc, ticker) stays with the owner. resonate_worker is NOLOGIN.
+-- everything else (DDL, gc, ticker) stays with the owner. resonate_worker is
+-- NOLOGIN: grant it to the login role your workers connect as, e.g.
+--   GRANT resonate_worker TO my_app_role;
 
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'resonate_worker') THEN
