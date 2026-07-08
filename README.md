@@ -1,4 +1,10 @@
-![Resonate](./assets/resonate-banner.png)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/banner-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/banner-light.png">
+    <img alt="Resonate on Postgres — Resonate Durable Execution in a single SQL file" src="./assets/banner-dark.png">
+  </picture>
+</p>
 
 # Resonate on Postgres
 
@@ -25,7 +31,13 @@ Crash the process, redeploy, or lose the machine mid-run — the workflow resume
 
 > **On Supabase?** [`example/countdown`](example/countdown) goes from an empty project to a running durable workflow in about five minutes.
 
-![Quickstart](./assets/quickstart-banner.png)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/getting-started-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/getting-started-light.png">
+    <img alt="Getting started" src="./assets/getting-started-dark.png">
+  </picture>
+</p>
 
 ## Getting started
 
