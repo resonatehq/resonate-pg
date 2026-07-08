@@ -2,6 +2,8 @@
 
 # Resonate on Postgres
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 **Dead simple durable execution.**
 
 Resonate durable execution runs your code as a reliable workflow, checkpointing each step as a durable promise, sleeping for days, surviving crashes and restarts. resonate-pg is one SQL file. No server process, no message broker, no timer service — Postgres, with pg_cron, is all three. Full Resonate docs live at [docs.resonatehq.io](https://docs.resonatehq.io).
@@ -17,7 +19,7 @@ resonate.register(
     yield* ctx.run(() => console.log("liftoff 🚀"));
   },
 );
-``` 
+```
 
 Crash the process, redeploy, or lose the machine mid-run — the workflow resumes on the right number, and nothing runs twice. Each `ctx.run` is checkpointed to Postgres as it completes, so a resumed run replays finished steps from the database instead of re-executing them. And `ctx.sleep` is just a row with a deadline: the invocation returns and nothing runs until it fires, whether that's ten minutes or ten days from now.
 
@@ -71,6 +73,15 @@ SELECT resonate.resonate_rpc('{"kind":"promise.get","head":{},"data":{"id":"invo
 ## Community
 
 Questions, ideas, or want to help? Join the [Resonate Discord](https://resonatehq.io/discord), or open an issue or pull request — contributions welcome. resonate-pg is part of [Resonate](https://github.com/resonatehq/resonate).
+
+- [Evaluate Resonate for your next project](https://docs.resonatehq.io/evaluate/)
+- [Example application library](https://github.com/resonatehq-examples)
+- [Distributed Async Await — the concepts that power Resonate](https://www.distributed-async-await.io/)
+- [Join the Discord](https://resonatehq.io/discord)
+- [Subscribe to the Journal](https://journal.resonatehq.io/subscribe)
+- [Follow on X](https://x.com/resonatehqio)
+- [Follow on LinkedIn](https://www.linkedin.com/company/resonatehqio)
+- [Subscribe on YouTube](https://www.youtube.com/@resonatehqio)
 
 ## License
 
