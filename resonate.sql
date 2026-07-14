@@ -444,6 +444,13 @@ DECLARE
   vh jsonb := COALESCE(p_value->'headers', '{}'::jsonb);
   vd text  := p_value->>'data';
 BEGIN
+  -- Only these states are client-settable: 'pending' is not a settlement and
+  -- 'rejected_timedout' is server-owned (the timeout path writes it), so a
+  -- client can never forge one. Rejected before any state is consulted (400
+  -- precedes the 404 on a missing promise and the sticky terminal echo).
+  IF p_state IS NULL OR p_state NOT IN ('resolved','rejected','rejected_canceled') THEN
+    RETURN jsonb_build_object('status', 400);
+  END IF;
   PERFORM _lock(p_id);
   SELECT * INTO p FROM promises WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
@@ -489,6 +496,14 @@ CREATE OR REPLACE FUNCTION promise_register_listener(
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE pa promises;
 BEGIN
+  -- An undeliverable address is a malformed request, rejected before any
+  -- state is consulted (400 precedes the 404 on a missing promise). Valid:
+  -- http(s)://..., or poll://... carrying an @group (poll://any@default).
+  IF p_address IS NULL
+     OR NOT (p_address LIKE 'http://%' OR p_address LIKE 'https://%'
+             OR (p_address LIKE 'poll://%' AND position('@' IN p_address) > 0)) THEN
+    RETURN jsonb_build_object('status', 400);
+  END IF;
   PERFORM _lock(p_awaited);
   SELECT * INTO pa FROM promises WHERE id = p_awaited FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
@@ -536,10 +551,13 @@ CREATE OR REPLACE FUNCTION task_create_typed(
 DECLARE p promises; t tasks; st text;
 BEGIN
   IF p_id IS NULL OR p_timeout_at IS NULL OR p_pid IS NULL OR p_ttl IS NULL THEN o_status := 400; RETURN; END IF;
+  -- The carried action must name a resonate:target — a task with no address
+  -- could never be dispatched. A malformed request, rejected with highest
+  -- precedence: before the lookup, so it applies on existing ids too.
+  IF NOT (p_tags ? 'resonate:target') THEN o_status := 400; RETURN; END IF;
   PERFORM _lock(p_id);
   SELECT * INTO p FROM promises WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN
-    IF NOT (p_tags ? 'resonate:target') THEN o_status := 400; RETURN; END IF;
     IF p_timeout_at > p_now THEN
       INSERT INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at)
       VALUES (p_id, 'pending', p_param_headers, p_param_data, p_tags, p_timeout_at, p_now) RETURNING * INTO p;
@@ -553,7 +571,9 @@ BEGIN
       INSERT INTO tasks (id, state, version) VALUES (p.id, 'fulfilled', 0) RETURNING * INTO t;
     END IF;
   ELSE
-    IF NOT (p.tags ? 'resonate:target') THEN o_status := 400; RETURN; END IF;
+    -- The id names a plain promise (no resonate:target): not a malformed
+    -- request but an unprocessable target — 422, matching the spec (T-02).
+    IF NOT (p.tags ? 'resonate:target') THEN o_status := 422; RETURN; END IF;
     SELECT * INTO t FROM tasks WHERE id = p.id FOR UPDATE;
     IF NOT FOUND THEN o_status := 409; RETURN; END IF;
     IF t.state = 'fulfilled' THEN
@@ -621,6 +641,10 @@ CREATE OR REPLACE FUNCTION task_fence(
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE t tasks; p promises; r jsonb; kind text := p_action->>'kind'; req jsonb := p_action->'req';
 BEGIN
+  -- A fence aimed at its own promise makes no sense: settling yourself is
+  -- task.fulfill's job, and allowing it would fulfill the fencing task as a
+  -- side effect of its own action. Rejected before any state is consulted.
+  IF req->>'id' = p_id THEN RETURN jsonb_build_object('status', 400); END IF;
   PERFORM _lock(p_id);
   SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
@@ -666,6 +690,14 @@ CREATE OR REPLACE FUNCTION task_suspend(
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE t tasks; tp promises; missing int; settled bool;
 BEGIN
+  -- A task awaiting its own promise is a self-deadlock by construction: the
+  -- callback it registers could only be fired by its own completion. A
+  -- malformed request, rejected with highest precedence — before existence,
+  -- state, or version are consulted.
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(p_actions, '[]'::jsonb)) act
+             WHERE act->>'awaited' = p_id) THEN
+    RETURN jsonb_build_object('status', 400);
+  END IF;
   PERFORM _lock(lid) FROM (
     SELECT p_id AS lid
     UNION
@@ -680,9 +712,6 @@ BEGIN
   IF t.state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
   IF tp.state <> 'pending' OR tp.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
   IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
-
-  IF EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(p_actions, '[]'::jsonb)) act
-             WHERE act->>'awaited' = t.id) THEN RETURN jsonb_build_object('status', 400); END IF;
 
   SELECT count(*) FILTER (WHERE pa.id IS NULL),
          COALESCE(bool_or(pa.state <> 'pending' OR pa.timeout_at <= p_now), false)
@@ -713,6 +742,11 @@ CREATE OR REPLACE FUNCTION task_fulfill_typed(
   LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE t tasks; p promises;
 BEGIN
+  -- Same validation as promise_settle, same precedence: the carried settle
+  -- must name a client-settable state before anything else is considered.
+  IF p_state IS NULL OR p_state NOT IN ('resolved','rejected','rejected_canceled') THEN
+    o_status := 400; RETURN;
+  END IF;
   PERFORM _lock(p_id);
   SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN o_status := 404; RETURN; END IF;
