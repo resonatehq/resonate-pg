@@ -1285,13 +1285,20 @@ $$;
 -- ▐  SECTION 11 · RETENTION · gc
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Terminal rows are marked, never auto-deleted. gc(settled_before, limit) deletes
+-- settled promises past the horizon — but never a checkpoint whose owning
+-- workflow is still running, or that step would re-run on resume (issue #6).
 
 CREATE OR REPLACE FUNCTION gc(p_settled_before bigint, p_limit int DEFAULT 10000)
   RETURNS bigint LANGUAGE sql AS $$
   WITH doomed AS (
-    SELECT ctid FROM promises
-    WHERE state <> 'pending' AND settled_at <= p_settled_before
-    ORDER BY settled_at
+    SELECT p.ctid FROM promises p
+    WHERE p.state <> 'pending' AND p.settled_at <= p_settled_before
+      -- ...but never a checkpoint whose owning workflow is still running:
+      -- deleting it lets the step re-run on resume, breaking exactly-once.
+      -- (origin_id is the root; NULL for unowned promises. issue #6)
+      AND NOT EXISTS (SELECT 1 FROM promises r
+                      WHERE r.id = p.origin_id AND r.state = 'pending')
+    ORDER BY p.settled_at
     LIMIT p_limit),
   del AS (
     DELETE FROM promises WHERE ctid IN (SELECT ctid FROM doomed) RETURNING id),
