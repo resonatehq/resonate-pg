@@ -543,6 +543,23 @@ END $$;
 
 DROP FUNCTION IF EXISTS task_create_typed(text, bigint, text, bigint, jsonb, text, jsonb, bigint);
 
+CREATE OR REPLACE FUNCTION _preload(p_origin text, p_now bigint, p_limit int DEFAULT 100)
+  RETURNS jsonb LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(jsonb_agg(pj ORDER BY ord), '[]'::jsonb)
+  FROM (
+    SELECT _promise_json(x, p_now) AS pj, x.created_at AS ord
+    FROM promises x
+    WHERE x.origin_id = p_origin
+      AND x.id <> p_origin
+      AND NOT EXISTS (
+        SELECT 1 FROM promises a
+        WHERE a.origin_id = p_origin
+          AND a.state <> 'pending'
+          AND starts_with(x.id, a.id || '.'))
+    ORDER BY x.created_at
+    LIMIT p_limit) s;
+$$;
+
 CREATE OR REPLACE FUNCTION task_create(
     p_pid text, p_ttl bigint, p_action jsonb, p_now bigint)
   RETURNS jsonb LANGUAGE plpgsql AS $$
@@ -590,7 +607,8 @@ BEGIN
     END IF;
   END IF;
   RETURN jsonb_build_object('status', 200, 'task', _task_json(t),
-                            'promise', _promise_json_raw(p));
+                            'promise', _promise_json_raw(p),
+                            'preload', _preload(p.origin_id, p_now, 100));
 END $$;
 
 CREATE OR REPLACE FUNCTION task_acquire(
@@ -614,7 +632,8 @@ BEGIN
                    timeout_at = p_now + p_ttl
     WHERE id = t.id RETURNING * INTO t;
   RETURN jsonb_build_object('status', 200, 'task', _task_json(t),
-                            'promise', _promise_json(p, p_now));
+                            'promise', _promise_json(p, p_now),
+                            'preload', _preload(p.origin_id, p_now, 100));
 END $$;
 
 CREATE OR REPLACE FUNCTION task_fence(
@@ -1023,8 +1042,8 @@ BEGIN
     WHEN 'promise.register_callback' THEN jsonb_build_object('promise', r->'promise')
     WHEN 'promise.register_listener' THEN jsonb_build_object('promise', r->'promise')
     WHEN 'task.get'                  THEN jsonb_build_object('task', r->'task')
-    WHEN 'task.create'               THEN jsonb_build_object('task', r->'task', 'promise', r->'promise', 'preload', '[]'::jsonb)
-    WHEN 'task.acquire'              THEN jsonb_build_object('task', r->'task', 'promise', r->'promise', 'preload', '[]'::jsonb)
+    WHEN 'task.create'               THEN jsonb_build_object('task', r->'task', 'promise', r->'promise', 'preload', COALESCE(r->'preload', '[]'::jsonb))
+    WHEN 'task.acquire'              THEN jsonb_build_object('task', r->'task', 'promise', r->'promise', 'preload', COALESCE(r->'preload', '[]'::jsonb))
     WHEN 'task.fulfill'              THEN jsonb_build_object('promise', r->'promise')
     WHEN 'task.suspend'              THEN jsonb_build_object('preload', '[]'::jsonb)
     WHEN 'schedule.get'              THEN jsonb_build_object('schedule', r->'schedule')
