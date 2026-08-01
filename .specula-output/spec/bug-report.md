@@ -58,6 +58,51 @@ ordering makes it unreachable again. That is the model-level statement of what
 `repro.sql` shows empirically: in `resonate.sql` the site is guarded by sequencing
 rather than by a predicate.
 
+## Phase 3A — trace validation (spec fidelity)
+
+Before hunting, the spec was checked against the real system. `Trace.tla` drives
+TLC through NDJSON traces recorded from a live Postgres running the instrumented
+`resonate.sql` (see `../harness/`), requiring at every step that the base spec
+can take the recorded action **and** that its state then equals the state the
+database actually held — promises, tasks, callbacks, listeners, resume records
+and both outbox kinds, field by field. `ValidatePostState` is not a stub and no
+captured field goes unchecked.
+
+| Trace | Events | Verdict | Depth |
+|---|---|---|---|
+| `suspend_resume` | 8 | ✅ valid | 11 |
+| `timeouts` | 9 | ✅ valid | 14 |
+| `claim_halt_continue` | 7 | ✅ valid | 9 |
+| `listener_callback` | 9 | ✅ valid | 12 |
+| `external_settle` | 6 | ✅ valid | 8 |
+
+39 recorded transitions across all 16 instrumented actions, every one reproduced
+by `base.tla` with exact post-state agreement. Each run is a single linear path
+with outdegree 1 — deterministic replay, no branching.
+
+### Negative controls
+
+Validation that cannot fail proves nothing, so two deliberate faults were
+injected into `base.tla` and the traces re-run:
+
+| Injected fault | Result |
+|---|---|
+| `OnTaskLeaseTimeout` bumps `version` (plausible, but not what :930 does) | `timeouts` **fails**; the other four pass — only it exercises a lease timeout |
+| `CascadeListeners` keeps the listener rows instead of consuming them | `external_settle` and `listener_callback` **fail**; the other three pass — only they register listeners |
+
+Both discriminate exactly, and only, the traces that exercise the mutated path.
+`base.tla` was restored and re-validated clean afterwards.
+
+**What this buys.** The counterexamples below are claims about `resonate.sql`,
+not just about a TLA+ file. Trace validation is the evidence that the file
+faithfully models the system — previously that rested on hand-argument plus the
+Phase 4 reproductions.
+
+**What it does not cover.** Trace validation exercises the paths the scenarios
+take; it cannot certify unexercised behaviour. Schedules, the create-a-new-promise
+branch of T-02, and `Dequeue` are outside the traced set (see
+`instrumentation-spec.md`).
+
 ## Case C-1 — `NoStrandedListener` violated
 
 **Counterexample** (6 states, `output/NoStrandedListener.out`):

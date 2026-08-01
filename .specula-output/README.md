@@ -28,27 +28,52 @@ And with the reference specification's guards switched on, **all seven invariant
 hold exhaustively** (`MC_fixed.cfg`) — the recommended fixes are verified, not just
 argued.
 
+The model itself is validated against the real system: five traces recorded from
+a live Postgres running the instrumented `resonate.sql` replay through `base.tla`
+with exact post-state agreement — **39 transitions covering all 16 instrumented
+actions** — and two injected spec faults are caught, so the check has teeth.
+
 ## Layout
 
 ```
-modeling-brief.md         Phase 1  code analysis -> spec design
-spec-comparison.md        resonate.sql vs. resonatehq/resonate-specification
-spec/base.tla             Phase 2  TLA+ model of resonate.sql, annotated with file:line
-spec/MC.tla, MC.cfg       Phase 2  model configuration
-spec/MC_hunt_*.cfg        Phase 2  one config per invariant
-spec/MC_fixed.cfg         Phase 3  every reference-spec guard applied
-spec/MC_timeout_*.cfg     Phase 3  isolates BUG-5 and its masking
-spec/bug-report.md        Phase 3  TLC results and counterexample traces
-spec/output/              Phase 3  raw TLC output
-repro/repro.sql           Phase 4  executable reproductions
-repro/repro-output.txt    Phase 4  recorded output of the above
-confirmed-bugs.md         Phase 4  confirmation report, with suggested fixes
+modeling-brief.md            Phase 1    code analysis -> spec design
+spec-comparison.md           resonate.sql vs. resonatehq/resonate-specification
+
+spec/base.tla                Phase 2    TLA+ model of resonate.sql, annotated with file:line
+spec/MC.tla, MC.cfg          Phase 2    model configuration
+spec/MC_hunt_*.cfg           Phase 2    one config per invariant
+spec/instrumentation-spec.md Phase 2    action -> code mapping, for the harness
+spec/Trace.tla, Trace.cfg    Phase 2    trace-validation spec
+
+harness/instrument.py        Phase 2.5  inserts emit calls into resonate.sql
+harness/src/trace.sql        Phase 2.5  trace table, state snapshot, emit
+harness/src/scenarios.sql    Phase 2.5  five workloads over the real RPC entrypoint
+harness/run.sh               Phase 2.5  instrument -> load -> run -> export NDJSON
+harness/INSTRUMENTATION.md   Phase 2.5  how to adjust the instrumentation
+traces/*.ndjson              Phase 2.5  recorded traces
+
+spec/validate-traces.sh      Phase 3A   replays every trace through TLC
+spec/MC_fixed.cfg            Phase 3C   every reference-spec guard applied
+spec/MC_timeout_*.cfg        Phase 3C   isolates BUG-5 and its masking
+spec/bug-report.md           Phase 3     TLC results and counterexample traces
+spec/output/                 Phase 3     raw TLC output
+
+repro/repro.sql              Phase 4    executable reproductions
+repro/repro-output.txt       Phase 4    recorded output of the above
+confirmed-bugs.md            Phase 4    confirmation report, with suggested fixes
 ```
 
 All five are filed upstream as issues #8-#12, and fixed on branch
 `claude/specula-fixes-mcynat` with regression tests in `test/regression.sql`.
 
 ## Reproducing
+
+Trace collection and validation (Phase 2.5 + 3A):
+
+```bash
+.specula-output/harness/run.sh                      # record traces
+TLA_LIB=/path/to/jars .specula-output/spec/validate-traces.sh
+```
 
 Model checking (needs Java 21+ and
 [`tla2tools.jar`](https://github.com/tlaplus/tlaplus/releases) v1.8.0):

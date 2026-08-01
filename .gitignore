@@ -3,3 +3,8 @@
 supabase/
 .env
 .env.*
+
+# Specula: TLC scratch output
+.specula-output/spec/states/
+.specula-output/spec/*_TTrace_*
+.specula-output/harness/build/
