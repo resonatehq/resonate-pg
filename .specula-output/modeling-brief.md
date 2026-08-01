@@ -208,7 +208,7 @@ each transaction as atomic, which is exactly what the locks buy).
 | CR-1 | `task_heartbeat` checks `t.pid = p_pid` (:667); `task_fulfill`, `task_release`, `task_suspend`, `task_fence` do not. Version is the fence token, so this is likely deliberate — but the asymmetry is undocumented. | confirm intent, add a comment |
 | CR-2 | Lock-order inversion, Scenario 4 (:290-291 vs :697-702) | document; the retry loops already contain it |
 | CR-3 | `callbacks.awaiter_id` has no FK (:70-74) while `awaited_id` does, so `gc` can leave orphan awaiter rows | harmless today (`_enqueue_resume` returns on a missing task), but worth a note |
-| CR-4 | An internal promise past its timeout is never reclaimable by `gc` and pins its whole `origin_id` group (:1275-1277) | second-order consequence of MC-1; fix follows from it |
+| CR-4 | An internal promise past its timeout is never reclaimable by `gc` (:1275), and if it is a workflow's `resonate:origin`, retains that whole group too (:1276-1277) | second-order consequence of MC-1; fix follows from it |
 
 ## 7. Reference Pointers
 

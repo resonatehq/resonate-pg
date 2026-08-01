@@ -66,9 +66,10 @@ row even read as `rejected_timedout` through `_promise_json`'s projection while
 never actually settling, so the timeout looked real and did nothing."
 
 **Second consequence**: because the row never leaves `pending`, `gc` can never
-reclaim it, and `gc`'s origin clause (:1276-1277) additionally pins *every*
-promise sharing its `resonate:origin`. One such promise pins its whole workflow's
-history indefinitely.
+reclaim it (:1275). And if such a promise is itself named as a workflow's
+`resonate:origin`, `gc`'s origin clause (:1276-1277) retains every settled promise
+in that group as well, since the clause requires the origin not to be pending —
+so one stuck promise can pin a whole workflow's history indefinitely.
 
 **Suggested fix**: mirror :488 — after the 404 check in
 `promise_register_listener`, `IF NOT pa.external THEN RETURN 422`. Alternatively,
