@@ -256,7 +256,7 @@ BEGIN
     INSERT INTO task_resumes (task_id, awaited_id) VALUES (t.id, p_awaited)
       ON CONFLICT DO NOTHING;
     SELECT target INTO tgt FROM promises WHERE id = p_awaiter;
-    IF tgt IS NOT NULL AND tgt <> '' THEN
+    IF tgt IS NOT NULL THEN
       PERFORM _emit_execute(tgt, t.id, t.version);
     END IF;
   ELSIF t.state IN ('pending', 'acquired', 'halted') THEN
@@ -511,6 +511,13 @@ BEGIN
   PERFORM _lock(p_awaited);
   SELECT * INTO pa FROM promises WHERE id = p_awaited FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
+  -- Listeners, like callbacks, attach only to EXTERNAL promises. Only an
+  -- external promise carries an enforced timeout (_promise_timed), so only
+  -- there can the unblock be guaranteed to arrive. Registering on an internal
+  -- awaited would record an obligation nothing can ever discharge: the promise
+  -- reads rejected_timedout through the projection while the row stays pending
+  -- forever, and no cascade ever runs. Mirrors P-04's guard above.
+  IF NOT pa.external THEN RETURN jsonb_build_object('status', 422); END IF;
 
   IF pa.state = 'pending' AND pa.timeout_at > p_now THEN
     INSERT INTO listeners (awaited_id, address) VALUES (p_awaited, p_address)
@@ -583,6 +590,17 @@ BEGIN
     IF NOT (p.tags ? 'resonate:target') THEN RETURN jsonb_build_object('status', 422); END IF;
     SELECT * INTO t FROM tasks WHERE id = p.id FOR UPDATE;
     IF NOT FOUND THEN RETURN jsonb_build_object('status', 409); END IF;
+    -- No lease is ever armed on a logically dead task. Re-acquisition is gated
+    -- on the PROJECTED promise, exactly as task.acquire (T-03) gates it; a
+    -- promise past its deadline whose timeout has not yet been processed is
+    -- settled as far as every observer is concerned. Serve the projected pair
+    -- -- fulfilled task, settled promise -- the same shape task.get returns.
+    IF p.state <> 'pending' OR p.timeout_at <= p_now THEN
+      RETURN jsonb_build_object('status', 200,
+        'task', jsonb_build_object('id', t.id, 'state', 'fulfilled', 'version', t.version,
+                                   'resumes', 0, 'ttl', NULL, 'pid', NULL),
+        'promise', _promise_json(p, p_now));
+    END IF;
     IF t.state = 'fulfilled' THEN
       NULL;
     ELSIF t.state = 'pending' THEN
@@ -594,7 +612,7 @@ BEGIN
     END IF;
   END IF;
   RETURN jsonb_build_object('status', 200, 'task', _task_json(t),
-                            'promise', _promise_json_raw(p));
+                            'promise', _promise_json(p, p_now));
 END $$;
 
 CREATE OR REPLACE FUNCTION task_acquire(
@@ -780,7 +798,7 @@ BEGIN
 
   UPDATE tasks SET state = 'pending', pid = NULL, ttl = NULL,
                    timeout_at = p_now + _retry_timeout() WHERE id = t.id;
-  IF p.target IS NOT NULL AND p.target <> '' THEN
+  IF p.target IS NOT NULL THEN
     PERFORM _emit_execute(p.target, t.id, t.version);
   END IF;
   RETURN jsonb_build_object('status', 200);
@@ -788,11 +806,20 @@ END $$;
 
 CREATE OR REPLACE FUNCTION task_halt(p_id text, p_now bigint) RETURNS jsonb
   LANGUAGE plpgsql AS $$
-DECLARE t tasks;
+DECLARE t tasks; p promises;
 BEGIN
   PERFORM _lock(p_id);
   SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
+  SELECT * INTO p FROM promises WHERE id = t.id;
+  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
+  -- Halting takes a LIVE task out of circulation. A task whose own promise is
+  -- logically settled has none left: task.get already reports it 'fulfilled',
+  -- and halt-on-fulfilled is 409. Branching on the raw stored state here would
+  -- make the stored-vs-projected divergence observable on the wire.
+  IF p.state <> 'pending' OR p.timeout_at <= p_now THEN
+    RETURN jsonb_build_object('status', 409);
+  END IF;
   IF t.state = 'fulfilled' THEN RETURN jsonb_build_object('status', 409); END IF;
   IF t.state = 'halted' THEN RETURN jsonb_build_object('status', 200); END IF;
 
@@ -810,9 +837,14 @@ BEGIN
   IF t.state <> 'halted' THEN RETURN jsonb_build_object('status', 409); END IF;
   SELECT * INTO p FROM promises WHERE id = t.id;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
+  -- Continuing a task whose promise is logically settled would put a dead
+  -- workflow back into circulation. There is no circulation left.
+  IF p.state <> 'pending' OR p.timeout_at <= p_now THEN
+    RETURN jsonb_build_object('status', 409);
+  END IF;
 
   UPDATE tasks SET state = 'pending', timeout_at = p_now + _retry_timeout() WHERE id = t.id;
-  IF p.target IS NOT NULL AND p.target <> '' THEN
+  IF p.target IS NOT NULL THEN
     PERFORM _emit_execute(p.target, t.id, t.version);
   END IF;
   RETURN jsonb_build_object('status', 200);
@@ -909,11 +941,15 @@ BEGIN
   SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN RETURN; END IF;
   IF t.state <> 'pending' THEN RETURN; END IF;
-
-  UPDATE tasks SET timeout_at = p_now + _retry_timeout() WHERE id = t.id;
   SELECT * INTO p FROM promises WHERE id = t.id;
   IF NOT FOUND THEN RETURN; END IF;
-  IF p.target IS NOT NULL AND p.target <> '' THEN
+  -- TIMEOUT ALWAYS WINS, extended to redispatch: create no new work for a
+  -- logically dead task -- not even a re-armed timer. Its cleanup belongs to
+  -- the promise-timeout transition alone.
+  IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN; END IF;
+
+  UPDATE tasks SET timeout_at = p_now + _retry_timeout() WHERE id = t.id;
+  IF p.target IS NOT NULL THEN
     PERFORM _emit_execute(p.target, t.id, t.version);
   END IF;
 END $$;
@@ -926,12 +962,15 @@ BEGIN
   SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN RETURN; END IF;
   IF t.state <> 'acquired' THEN RETURN; END IF;
+  SELECT * INTO p FROM promises WHERE id = t.id;
+  IF NOT FOUND THEN RETURN; END IF;
+  -- TIMEOUT ALWAYS WINS, extended to reassignment: an expired lease on a
+  -- logically dead task is not returned to circulation.
+  IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN; END IF;
 
   UPDATE tasks SET state = 'pending', pid = NULL, ttl = NULL,
                    timeout_at = p_now + _retry_timeout() WHERE id = t.id;
-  SELECT * INTO p FROM promises WHERE id = t.id;
-  IF NOT FOUND THEN RETURN; END IF;
-  IF p.target IS NOT NULL AND p.target <> '' THEN
+  IF p.target IS NOT NULL THEN
     PERFORM _emit_execute(p.target, t.id, t.version);
   END IF;
 END $$;
