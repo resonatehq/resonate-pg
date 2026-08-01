@@ -45,6 +45,9 @@ repro/repro-output.txt    Phase 4  recorded output of the above
 confirmed-bugs.md         Phase 4  confirmation report, with suggested fixes
 ```
 
+All five are filed upstream as issues #8-#12, and fixed on branch
+`claude/specula-fixes-mcynat` with regression tests in `test/regression.sql`.
+
 ## Reproducing
 
 Model checking (needs Java 21+ and

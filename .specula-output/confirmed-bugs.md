@@ -198,12 +198,29 @@ The task is left permanently `pending`, its retry timer rescheduling every 5s
 forever and emitting nothing. The one message it did produce went to the empty
 address, where `pg_notify` fires on `resonate_q_` + md5('').
 
-**Suggested fix**: normalize once at the boundary. Either reject an empty
-`resonate:target` at `promise_create` (400), or treat `''` as absent there —
-`IF NULLIF(tgt, '') IS NOT NULL` — so the creation site agrees with the five
-sites that already use the `<> ''` form. `resonate.invoke` (:1182) already applies
-`NULLIF(target, '')`, so the boundary convention exists; `promise_create` just
-does not follow it.
+**Suggested fix**: make the five redelivery sites agree with the creation site by
+dropping the `<> ''` special case, so `resonate:target` is either present or
+absent everywhere:
+
+```sql
+IF p.target IS NOT NULL THEN
+  PERFORM _emit_execute(p.target, t.id, t.version);
+END IF;
+```
+
+This is the direction the reference specification takes: it has no emptiness check
+anywhere — the creation handler branches on `resonate:target` being present, and
+every redelivery site emits with `(p.tags.get? "resonate:target").getD ""`. An
+empty target is a present-but-unroutable address, consistently, and the task
+retries like any task whose worker is not listening.
+
+*Correction to an earlier draft of this report*, which suggested normalizing the
+other way (treating `''` as absent at `promise_create`). That is wrong:
+`promises.external` is a generated column keyed on
+`tags->>'resonate:target' IS NOT NULL` (:38-41), so the promise would remain
+external while having no task to drive it — breaking the "a promise with a target
+has a task" correspondence that the reference's `PromiseWithTargetHasTask`
+invariant states.
 
 ---
 
