@@ -83,8 +83,8 @@ never actually settled, the two never reconcile.
 **Evidence**:
 - Code analysis: :183-186 projection; :206 eligibility restricted to `external`;
   :1275 `gc` filters on `p.state <> 'pending'`, so a promise that only *projects*
-  as settled is never reclaimed, and :1276-1277 additionally pins every promise
-  sharing its `origin_id`.
+  as settled is never reclaimed; :1276-1277 additionally retains a whole group
+  when the stuck promise is that group's `origin_id`.
 - Code analysis: :596-597 `task_create` returns `_promise_json_raw(p)` — the
   projection with `now = -1`, i.e. deliberately *un*projected — so T-02 hands the
   worker `pending` for a promise that P-01 reports as `rejected_timedout`.
