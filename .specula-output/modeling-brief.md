@@ -39,7 +39,11 @@ use for what is nominally one question:
 |---|---|
 | `p.state = 'pending' AND p.timeout_at > now` | :461, :613, :640, :709, :759, :778 |
 | `_promise_timed(p)` = `state='pending' AND external` | :204-207, :966 |
-| *(no check at all)* | :583-594 (task.create claim), :803-819 (task.continue), :515 (register_listener) |
+| *(no check at all)* | :583-594 (task.create claim), :803-819 (task.continue), :789-801 (task.halt), :904-937 (both task-timeout handlers), :515 (register_listener) |
+
+**Confirmed against the reference specification** after this brief was written:
+`resonatehq/resonate-specification` branch `claude/close-the-square` gates every
+one of those sites. See `spec-comparison.md`.
 
 **Evidence**:
 - Historical: `34ebe99` "Enforce timeouts on external promises" — a promise whose

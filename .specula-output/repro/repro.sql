@@ -1,5 +1,5 @@
 -- =============================================================================
--- Specula Phase 4 · reproduction tests for the three confirmed findings
+-- Specula Phase 4 · reproduction tests for the five confirmed findings
 -- =============================================================================
 --   psql -d yourdb -f resonate.sql
 --   psql -d yourdb -f .specula-output/repro/repro.sql
@@ -179,5 +179,85 @@ SELECT CASE WHEN
     AND (SELECT count(*) FROM resonate.outbox) = 0
   THEN 'BUG-3 REPRODUCED: task pending forever, retry timer emits nothing'
   ELSE 'BUG-3 not reproduced' END AS result;
+
+\echo ''
+-- =============================================================================
+-- BUG-4 · task.halt succeeds on a task that task.get already reports fulfilled.
+--
+--   The reference spec's T-09 returns 409 once the promise is logically
+--   settled, with the reasoning stated in the handler: "Branching on the raw
+--   stored task here would make the stored-vs-projected divergence observable
+--   — the one thing the projection discipline forbids."  resonate.sql's
+--   task_halt (:789-801) never loads the promise at all.
+-- =============================================================================
+\echo ''
+\echo '=== BUG-4: task.halt on a task task.get calls fulfilled ==='
+SELECT pg_temp.reset();
+
+SELECT pg_temp.rpc('promise.create',
+       '{"id":"h1","timeoutAt":2000,"tags":{"resonate:target":"poll://any@w1"}}'::jsonb,
+       1000)->'head'->>'status' AS create_status;
+DELETE FROM resonate.outbox;
+
+-- t=9000: promise logically dead, driver has not ticked.
+SELECT
+  pg_temp.rpc('task.get','{"id":"h1"}'::jsonb, 9000)
+    ->'data'->'task'->>'state'                              AS task_get_reports,
+  pg_temp.rpc('task.halt','{"id":"h1"}'::jsonb, 9000)
+    ->'head'->>'status'                                     AS halt_status,
+  (SELECT state FROM resonate.tasks WHERE id = 'h1')        AS task_row_after;
+
+SELECT CASE WHEN
+    (SELECT state FROM resonate.tasks WHERE id = 'h1') = 'halted'
+  THEN 'BUG-4 REPRODUCED: task.get says fulfilled (halt-on-fulfilled is 409), '
+       || 'yet task.halt returned 200 and halted it'
+  ELSE 'BUG-4 not reproduced' END AS result;
+
+-- =============================================================================
+-- BUG-5 · the task timeout handlers redispatch a logically dead workflow.
+--
+--   _on_task_retry_timeout (:904-919) and _on_task_lease_timeout (:921-937)
+--   read the promise only for its target and never consult its state or
+--   timeout.  The reference spec added that gate in 3e8a1d6, "no new work for
+--   the dead".  In resonate.sql the gap is MASKED inside process_timeouts
+--   (:997-1012), which drains promise timeouts before task timeouts; it is
+--   exposed by calling process_task_timeouts() on its own.
+-- =============================================================================
+\echo ''
+\echo '=== BUG-5: task timeout handlers redispatch a dead workflow ==='
+SELECT pg_temp.reset();
+
+SELECT pg_temp.rpc('promise.create',
+       '{"id":"h2","timeoutAt":3000,"tags":{"resonate:target":"poll://any@w1"}}'::jsonb,
+       1000)->'head'->>'status' AS create_status;
+SELECT pg_temp.rpc('task.acquire',
+       '{"id":"h2","version":0,"pid":"w1","ttl":500}'::jsonb, 1000)
+       ->'head'->>'status' AS acquire_status;
+DELETE FROM resonate.outbox;
+
+-- lease expired at 1500, promise expired at 3000, now = 9000.
+SELECT resonate.process_task_timeouts(9000) AS task_loop_processed;
+SELECT
+  (SELECT count(*) FROM resonate.outbox WHERE kind = 'execute') AS execute_msgs,
+  (SELECT state FROM resonate.tasks WHERE id = 'h2')            AS task_state,
+  (SELECT state FROM resonate.promises WHERE id = 'h2')         AS promise_row;
+
+SELECT CASE WHEN (SELECT count(*) FROM resonate.outbox WHERE kind = 'execute') = 1
+  THEN 'BUG-5 REPRODUCED (via process_task_timeouts): dead workflow redispatched'
+  ELSE 'BUG-5 not reproduced' END AS result;
+
+-- The shipped driver masks it: promise timeouts drain first.
+SELECT pg_temp.reset();
+SELECT pg_temp.rpc('promise.create',
+       '{"id":"h3","timeoutAt":3000,"tags":{"resonate:target":"poll://any@w1"}}'::jsonb,
+       1000)->'head'->>'status' AS create_status;
+SELECT pg_temp.rpc('task.acquire',
+       '{"id":"h3","version":0,"pid":"w1","ttl":500}'::jsonb, 1000)
+       ->'head'->>'status' AS acquire_status;
+DELETE FROM resonate.outbox;
+SELECT resonate.process_timeouts(9000) AS full_driver_processed;
+SELECT CASE WHEN (SELECT count(*) FROM resonate.outbox WHERE kind = 'execute') = 0
+  THEN 'BUG-5 MASKED via process_timeouts: ordering, not a guard, is what saves it'
+  ELSE 'BUG-5 also reproduces through the full driver' END AS result;
 
 \echo ''

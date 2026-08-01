@@ -1,15 +1,15 @@
 Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/root/.ccr/java-truststore.p12 -Djavax.net.ssl.trustStorePassword=changeit -Djavax.net.ssl.trustStoreType=PKCS12 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=39133 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|anthropic.com|*.anthropic.com|*.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
 TLC2 Version 2026.07.31.184830 (rev: 30cc360)
-Running breadth-first search Model-Checking with fp 93 and seed -3729176534732943366 with 4 workers on 4 cores with 2731MB heap and 64MB offheap memory [pid: 16122] (Linux 6.18.5 amd64, Ubuntu 21.0.10 64bit, MSBDiskFPSet, DiskStateQueue).
+Running breadth-first search Model-Checking with fp 120 and seed -1998612716078521501 with 4 workers on 4 cores with 2731MB heap and 64MB offheap memory [pid: 15083] (Linux 6.18.5 amd64, Ubuntu 21.0.10 64bit, MSBDiskFPSet, DiskStateQueue).
 Parsing file /home/user/resonate-pg/.specula-output/spec/MC.tla
 Parsing file /home/user/resonate-pg/.specula-output/spec/base.tla
-Parsing file /tmp/tlc-11058846150547174092/_TLCTrace.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
-Parsing file /tmp/tlc-11058846150547174092/Naturals.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
-Parsing file /tmp/tlc-11058846150547174092/FiniteSets.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
-Parsing file /tmp/tlc-11058846150547174092/Sequences.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
-Parsing file /tmp/tlc-11058846150547174092/TLC.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
-Parsing file /tmp/tlc-11058846150547174092/TLCExt.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
-Parsing file /tmp/tlc-11058846150547174092/Integers.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /tmp/tlc-4116126319265875755/_TLCTrace.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-4116126319265875755/Naturals.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-4116126319265875755/FiniteSets.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-4116126319265875755/Sequences.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-4116126319265875755/TLC.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-4116126319265875755/TLCExt.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /tmp/tlc-4116126319265875755/Integers.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
 Semantic processing of module Naturals
 Semantic processing of module Sequences
 Semantic processing of module FiniteSets
@@ -23,9 +23,9 @@ Linting of module base
 Linting of module TLCExt
 Linting of module _TLCTrace
 Linting of module MC
-Starting... (2026-08-01 17:40:38)
+Starting... (2026-08-01 17:29:57)
 Computing initial states...
-Finished computing initial states: 1 distinct state generated at 2026-08-01 17:40:38.
+Finished computing initial states: 1 distinct state generated at 2026-08-01 17:29:57.
 Error: Invariant NoDeadDispatch is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
@@ -57,26 +57,27 @@ State 1: <Initial predicate>
 
 State 2: <Next line 430, col 5 to line 434, col 29 of module base>
 /\ callbacks = {}
-/\ tasks = ( a :> [version |-> 0, exists |-> TRUE, state |-> "pending", timeoutAt |-> 1] @@
+/\ tasks = ( a :>
+      [version |-> 0, exists |-> FALSE, state |-> "pending", timeoutAt |-> 0] @@
   b :> [version |-> 0, exists |-> FALSE, state |-> "pending", timeoutAt |-> 0] )
 /\ badHalt = {}
 /\ promises = ( a :>
-      [ exists |-> TRUE,
-        state |-> "pending",
-        timeoutAt |-> 1,
-        external |-> TRUE,
-        isTimer |-> FALSE,
-        hasTarget |-> TRUE ] @@
-  b :>
       [ exists |-> FALSE,
         state |-> "pending",
         timeoutAt |-> 0,
         external |-> FALSE,
         isTimer |-> FALSE,
+        hasTarget |-> FALSE ] @@
+  b :>
+      [ exists |-> TRUE,
+        state |-> "pending",
+        timeoutAt |-> 1,
+        external |-> TRUE,
+        isTimer |-> FALSE,
         hasTarget |-> FALSE ] )
 /\ now = 0
 /\ badDispatch = {}
-/\ outbox = {[version |-> 0, kind |-> "execute", id |-> a, addr |-> "-"]}
+/\ outbox = {}
 /\ listeners = {}
 /\ resumes = {}
 /\ obs = (a :> "none" @@ b :> "none")
@@ -94,23 +95,22 @@ State 3: <Next line 430, col 5 to line 434, col 29 of module base>
         isTimer |-> FALSE,
         hasTarget |-> TRUE ] @@
   b :>
-      [ exists |-> FALSE,
+      [ exists |-> TRUE,
         state |-> "pending",
-        timeoutAt |-> 0,
-        external |-> FALSE,
+        timeoutAt |-> 1,
+        external |-> TRUE,
         isTimer |-> FALSE,
         hasTarget |-> FALSE ] )
-/\ now = 1
+/\ now = 0
 /\ badDispatch = {}
 /\ outbox = {[version |-> 0, kind |-> "execute", id |-> a, addr |-> "-"]}
 /\ listeners = {}
 /\ resumes = {}
-/\ obs = (a :> "rejected_timedout" @@ b :> "none")
+/\ obs = (a :> "none" @@ b :> "none")
 
 State 4: <Next line 430, col 5 to line 434, col 29 of module base>
 /\ callbacks = {}
-/\ tasks = ( a :>
-      [version |-> 1, exists |-> TRUE, state |-> "acquired", timeoutAt |-> 2] @@
+/\ tasks = ( a :> [version |-> 0, exists |-> TRUE, state |-> "pending", timeoutAt |-> 1] @@
   b :> [version |-> 0, exists |-> FALSE, state |-> "pending", timeoutAt |-> 0] )
 /\ badHalt = {}
 /\ promises = ( a :>
@@ -121,10 +121,36 @@ State 4: <Next line 430, col 5 to line 434, col 29 of module base>
         isTimer |-> FALSE,
         hasTarget |-> TRUE ] @@
   b :>
-      [ exists |-> FALSE,
+      [ exists |-> TRUE,
         state |-> "pending",
-        timeoutAt |-> 0,
-        external |-> FALSE,
+        timeoutAt |-> 1,
+        external |-> TRUE,
+        isTimer |-> FALSE,
+        hasTarget |-> FALSE ] )
+/\ now = 1
+/\ badDispatch = {}
+/\ outbox = {[version |-> 0, kind |-> "execute", id |-> a, addr |-> "-"]}
+/\ listeners = {}
+/\ resumes = {}
+/\ obs = (a :> "rejected_timedout" @@ b :> "rejected_timedout")
+
+State 5: <Next line 430, col 5 to line 434, col 29 of module base>
+/\ callbacks = {}
+/\ tasks = ( a :> [version |-> 0, exists |-> TRUE, state |-> "pending", timeoutAt |-> 2] @@
+  b :> [version |-> 0, exists |-> FALSE, state |-> "pending", timeoutAt |-> 0] )
+/\ badHalt = {}
+/\ promises = ( a :>
+      [ exists |-> TRUE,
+        state |-> "pending",
+        timeoutAt |-> 1,
+        external |-> TRUE,
+        isTimer |-> FALSE,
+        hasTarget |-> TRUE ] @@
+  b :>
+      [ exists |-> TRUE,
+        state |-> "pending",
+        timeoutAt |-> 1,
+        external |-> TRUE,
         isTimer |-> FALSE,
         hasTarget |-> FALSE ] )
 /\ now = 1
@@ -132,9 +158,9 @@ State 4: <Next line 430, col 5 to line 434, col 29 of module base>
 /\ outbox = {[version |-> 0, kind |-> "execute", id |-> a, addr |-> "-"]}
 /\ listeners = {}
 /\ resumes = {}
-/\ obs = (a :> "rejected_timedout" @@ b :> "none")
+/\ obs = (a :> "rejected_timedout" @@ b :> "rejected_timedout")
 
-2497 states generated, 1579 distinct states found, 1352 states left on queue.
-The depth of the complete state graph search is 6.
-Finished in 00s at (2026-08-01 17:40:39)
-Trace exploration spec path: ./MC_TTrace_1785606038.tla
+2311 states generated, 1518 distinct states found, 1297 states left on queue.
+The depth of the complete state graph search is 5.
+Finished in 01s at (2026-08-01 17:29:58)
+Trace exploration spec path: ./MC_TTrace_1785605397.tla

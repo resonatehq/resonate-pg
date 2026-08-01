@@ -6,8 +6,14 @@ Every finding below was reproduced against a live Postgres 16 instance with
 `.specula-output/repro/repro.sql` and its recorded output is
 `.specula-output/repro/repro-output.txt`.
 
-All three share one mechanism: **"is this promise still alive?" is answered by
+All five share one mechanism: **"is this promise still alive?" is answered by
 three different predicates at different call sites** (modeling brief, Scenario 1).
+
+Findings 1, 2, 4 and 5 are also **divergences from the reference specification**
+(`resonatehq/resonate-specification`, branch `claude/close-the-square`, which is
+14 commits ahead of `main` and carries two commits that tighten exactly these
+rules). See `spec-comparison.md` for the three-way comparison; the normative
+wording for each fix is quoted there.
 
 ---
 
@@ -71,6 +77,15 @@ reclaim it (:1275). And if such a promise is itself named as a workflow's
 in that group as well, since the clause requires the origin not to be pending —
 so one stuck promise can pin a whole workflow's history indefinitely.
 
+**The reference spec agrees.** `resonate-specification` commit `6ddfab7`
+("external-only waiters everywhere") added exactly this guard, for exactly this
+reason: "without the guard the machine accepted an obligation its transition
+relation cannot discharge (an internal promise that dies by deadline is settled
+by projection only -- no tau ever emits the unblock)." Its `state.lean` docstring
+now says internal promises must not have awaiters -- "ENFORCED: both registration
+paths (`register_callback`, `register_listener`) refuse internal promises with
+`422`".
+
 **Suggested fix**: mirror :488 — after the 404 check in
 `promise_register_listener`, `IF NOT pa.external THEN RETURN 422`. Alternatively,
 enforce timeouts for all promises rather than only external ones, which would
@@ -124,6 +139,15 @@ T-02 hands the worker a promise that reads `pending` while P-01 reads
 *emits an execute* (:816). Reproduced: halt a task, let its promise expire, call
 `task.continue` → `200` and one execute message queued for an already-dead
 workflow.
+
+**The reference spec agrees.** Its T-02 claim branch is gated
+(`if p.state == .pending ∧ p.timeoutAt > now`) with the comment "No lease is ever
+armed on a logically dead task", and its T-10 returns 409. The unprojected
+response is a separate known defect there too
+(branch `fix/task-create-serve-projected-record`): serving the raw record "made
+settled-promise stability falsifiable on the wire: GET could answer
+rejectedTimedout and a later task.create could answer pending for the same
+promise" — which is what `repro-output.txt` shows.
 
 **Suggested fix**: apply T-03's guard at both sites. In `task_create`'s claim
 branch, after the task row is located, and in `task_continue` after the promise is
@@ -183,6 +207,72 @@ does not follow it.
 
 ---
 
+---
+
+## BUG-4 — `task.halt` succeeds on a task `task.get` already reports `fulfilled`
+
+**Tier A.** Found by comparison with the reference spec, reproduced on a live
+database, then confirmed by model checking (`NoHaltOnDead`).
+
+**Where**: `task_halt`, `resonate.sql:789-801` — it never loads the promise.
+
+`task_get` (:540-545) projects a task as `fulfilled` as soon as its promise is no
+longer effectively pending. `task_halt` branches only on the *stored* task state.
+So at one instant, for one task:
+
+```
+task.get  -> state "fulfilled"        (and halt-on-fulfilled is 409, :796)
+task.halt -> 200, task row becomes 'halted'
+```
+
+The reference spec's T-09 returns 409 here and names the principle: "Branching on
+the raw stored task here would make the stored-vs-projected divergence
+observable — the one thing the projection discipline forbids."
+
+The state self-heals — the promise timeout later cascades the task to
+`fulfilled` — but the two responses contradict each other on the wire, which is
+the property `Stickiness` protects for promises and nothing protects for tasks.
+
+**Suggested fix**: load the promise and return 409 unless
+`p.state = 'pending' AND p.timeout_at > p_now`, ahead of the `t.state` checks.
+
+---
+
+## BUG-5 — the task timeout handlers redispatch a logically dead workflow
+
+**Tier C (latent).** Found by comparison with the reference spec, reproduced —
+but only when the handlers are reached outside the shipped driver.
+
+**Where**: `_on_task_retry_timeout` :904-919, `_on_task_lease_timeout` :921-937.
+Both read the promise solely for `p.target` and never consult its state.
+
+```
+process_task_timeouts(9000) on a lease-expired task whose promise died at 3000
+  -> task re-pended, one execute emitted   (a dispatch that can never be fulfilled)
+```
+
+**Why it is Tier C and not Tier A**: through `process_timeouts` (:997-1012) it
+cannot happen. That function drains `process_promise_timeouts` before
+`process_task_timeouts`, and every task's promise carries a target and is
+therefore external, so the promise loop settles it and the cascade fulfils the
+task before the task loop runs. Verified both ways in `repro.sql`.
+
+So resonate.sql is correct here **by sequencing, not by guard** — and nothing
+states or tests that dependency. `process_task_timeouts` is a callable function in
+its own right (it is not granted to `resonate_worker`, so this is an
+operator-reachable path, not a client-reachable one).
+
+The reference spec closed it with a guard in `3e8a1d6` ("no new work for the
+dead"), where it had to: its timeout transitions are independent τ rules with no
+ordering between them, so there the same gap was "the sole source of the
+doomed-dispatch message surplus".
+
+**Suggested fix**: gate both handlers on the promise, matching T-08 `task_release`
+(:778), which already does exactly this for the client-driven version of the same
+decision. Cheap, and it removes the unstated ordering dependency.
+
+---
+
 ## Dispositions
 
 | ID | Tier | Status | Mechanism |
@@ -191,6 +281,8 @@ does not follow it.
 | BUG-2 | A | Reproduced, live DB + 4-state counterexample | promise-liveness guard missing at 2 of 8 task entry points |
 | BUG-2b | A | Reproduced, live DB | same |
 | BUG-3 | B | Reproduced, live DB | `''` vs `NULL` disagreement across 6 sites |
+| BUG-4 | A | Reproduced, live DB + `NoHaltOnDead` counterexample | stored-vs-projected divergence made observable |
+| BUG-5 | C | Reproduced via `process_task_timeouts`; masked by driver ordering | same guard gap, contained by sequencing |
 
 ## Refuted during this run
 

@@ -155,3 +155,83 @@
 (1 row)
 
 
+
+=== BUG-4: task.halt on a task task.get calls fulfilled ===
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+ task_get_reports | halt_status | task_row_after 
+------------------+-------------+----------------
+ fulfilled        | 200         | pending
+(1 row)
+
+                                                     result                                                     
+----------------------------------------------------------------------------------------------------------------
+ BUG-4 REPRODUCED: task.get says fulfilled (halt-on-fulfilled is 409), yet task.halt returned 200 and halted it
+(1 row)
+
+
+=== BUG-5: task timeout handlers redispatch a dead workflow ===
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+ acquire_status 
+----------------
+ 200
+(1 row)
+
+ task_loop_processed 
+---------------------
+                   1
+(1 row)
+
+ execute_msgs | task_state | promise_row 
+--------------+------------+-------------
+            1 | pending    | pending
+(1 row)
+
+                                  result                                  
+--------------------------------------------------------------------------
+ BUG-5 REPRODUCED (via process_task_timeouts): dead workflow redispatched
+(1 row)
+
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+ acquire_status 
+----------------
+ 200
+(1 row)
+
+ full_driver_processed 
+-----------------------
+                     1
+(1 row)
+
+                                   result                                   
+----------------------------------------------------------------------------
+ BUG-5 MASKED via process_timeouts: ordering, not a guard, is what saves it
+(1 row)
+
+

@@ -24,7 +24,25 @@ CONSTANTS
     MaxTime,      \* time horizon
     MaxVersion,   \* bound on task.version, to keep the state space finite
     Retry,        \* _retry_timeout(), resonate.sql:175
-    Ttl           \* lease ttl handed to task.acquire / task.create
+    Ttl,          \* lease ttl handed to task.acquire / task.create
+
+    (***********************************************************************)
+    (* Switches that select between resonate.sql as shipped and the guards  *)
+    (* the reference specification (resonatehq/resonate-specification,      *)
+    (* branch claude/close-the-square) requires.  Setting all three to TRUE *)
+    (* models the fixed server; MC.cfg / MC_fixed.cfg run both.             *)
+    (***********************************************************************)
+    ListenerExternalGuard,  \* P-05 refuses an internal awaited with 422
+    PromiseLivenessGuard,   \* T-02 claim / T-09 halt / T-10 continue gate on
+                            \* p.state = pending AND p.timeout_at > now
+    TimeoutLivenessGuard,   \* the two task-timeout handlers gate on the same
+                            \* predicate (spec 3e8a1d6); kept separate so the
+                            \* model can isolate that site from T-02/09/10
+    SequencedDriver         \* TRUE models process_timeouts (:997-1012), which
+                            \* runs the promise loop to a fixpoint before the
+                            \* task loop; FALSE models the task-timeout
+                            \* handlers reached on their own, e.g. via a bare
+                            \* process_task_timeouts() call (:973-985)
 
 NoAddr == "-"
 ASSUME NoAddr \notin Addrs
@@ -43,10 +61,13 @@ VARIABLES
     resumes,      \* resonate.task_resumes : set of <<task, awaited>>
     outbox,       \* resonate.outbox
     obs,          \* history: first non-pending state each promise was ever observed in
-    badDispatch   \* history: ids handed an execution lease while already observably dead
+    badDispatch,  \* history: ids handed an execution lease / dispatched while
+                  \* already observably dead
+    badHalt       \* history: ids whose task was halted while task.get would
+                  \* already have reported that task 'fulfilled'
 
 vars == <<now, promises, tasks, callbacks, listeners, resumes, outbox,
-          obs, badDispatch>>
+          obs, badDispatch, badHalt>>
 
 core == <<promises, tasks, callbacks, listeners, resumes, outbox>>
 
@@ -161,7 +182,7 @@ PromiseCreate(i, toat, kind) ==
                                                       version |-> 0, timeoutAt |-> 0]]
                   ELSE UNCHANGED tasks
                /\ UNCHANGED outbox
-    /\ UNCHANGED <<now, callbacks, listeners, resumes, badDispatch>>
+    /\ UNCHANGED <<now, callbacks, listeners, resumes, badDispatch, badHalt>>
 
 \* promise_settle, resonate.sql:442-469.  P-03.  Only the effective branch is
 \* modelled; every other branch is a pure read.
@@ -170,7 +191,7 @@ PromiseSettle(i, st) ==
     /\ promises[i].state = "pending"
     /\ promises[i].timeoutAt > now          \* resonate.sql:461
     /\ DoSettle(i, st)
-    /\ UNCHANGED <<now, badDispatch>>
+    /\ UNCHANGED <<now, badDispatch, badHalt>>
 
 \* promise_register_callback, resonate.sql:471-499.  P-04.
 RegisterCallback(aw, ar) ==
@@ -183,16 +204,19 @@ RegisterCallback(aw, ar) ==
     /\ promises[ar].state = "pending" /\ promises[ar].timeoutAt > now
     /\ <<aw, ar>> \notin callbacks
     /\ callbacks' = callbacks \cup {<<aw, ar>>}
-    /\ UNCHANGED <<now, promises, tasks, listeners, resumes, outbox, badDispatch>>
+    /\ UNCHANGED <<now, promises, tasks, listeners, resumes, outbox, badDispatch, badHalt>>
 
 \* promise_register_listener, resonate.sql:501-520.  P-05.
-\* NOTE: there is no `external` guard here, unlike P-04 above.
+\* resonate.sql has no `external` guard here, unlike P-04 above.  The
+\* reference spec added one -- 422, mirroring P-04 -- in
+\* resonate-specification 6ddfab7 "external-only waiters everywhere".
 RegisterListener(aw, ad) ==
     /\ promises[aw].exists                  \* 404
+    /\ ListenerExternalGuard => promises[aw].external      \* 422 (spec only)
     /\ promises[aw].state = "pending" /\ promises[aw].timeoutAt > now
     /\ <<aw, ad>> \notin listeners
     /\ listeners' = listeners \cup {<<aw, ad>>}
-    /\ UNCHANGED <<now, promises, tasks, callbacks, resumes, outbox, badDispatch>>
+    /\ UNCHANGED <<now, promises, tasks, callbacks, resumes, outbox, badDispatch, badHalt>>
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -207,6 +231,7 @@ TaskClaim(i) ==
     /\ promises[i].hasTarget
     /\ tasks[i].exists
     /\ tasks[i].state = "pending"
+    /\ PromiseLivenessGuard => Proj(i) = "pending"         \* spec T-02 gate
     /\ tasks[i].version < MaxVersion
     /\ tasks'   = [tasks EXCEPT ![i].state = "acquired",
                                 ![i].version = tasks[i].version + 1,
@@ -214,7 +239,7 @@ TaskClaim(i) ==
     /\ resumes' = {r \in resumes : r[1] # i}
     /\ badDispatch' = IF Proj(i) # "pending"
                       THEN badDispatch \cup {i} ELSE badDispatch
-    /\ UNCHANGED <<now, promises, callbacks, listeners, outbox>>
+    /\ UNCHANGED <<now, promises, callbacks, listeners, outbox, badHalt>>
 
 \* task_acquire, resonate.sql:600-622.  T-03.
 TaskAcquire(i) ==
@@ -228,7 +253,7 @@ TaskAcquire(i) ==
                                 ![i].version = tasks[i].version + 1,
                                 ![i].timeoutAt = now + Ttl]
     /\ resumes' = {r \in resumes : r[1] # i}             \* resonate.sql:616
-    /\ UNCHANGED <<now, promises, callbacks, listeners, outbox, badDispatch>>
+    /\ UNCHANGED <<now, promises, callbacks, listeners, outbox, badDispatch, badHalt>>
 
 \* task_suspend, resonate.sql:673-735.  T-06.
 TaskSuspend(i, S) ==
@@ -248,7 +273,7 @@ TaskSuspend(i, S) ==
             /\ callbacks' = callbacks \cup {<<j, i>> : j \in S}
             /\ resumes'   = {r \in resumes : r[1] # i}
             /\ tasks'     = [tasks EXCEPT ![i].state = "suspended"]
-    /\ UNCHANGED <<now, promises, listeners, outbox, badDispatch>>
+    /\ UNCHANGED <<now, promises, listeners, outbox, badDispatch, badHalt>>
 
 \* task_fulfill, resonate.sql:739-765.  T-07.
 TaskFulfill(i, st) ==
@@ -258,7 +283,7 @@ TaskFulfill(i, st) ==
     /\ promises[i].state = "pending"
     /\ promises[i].timeoutAt > now                       \* 409, resonate.sql:759
     /\ DoSettle(i, st)
-    /\ UNCHANGED <<now, badDispatch>>
+    /\ UNCHANGED <<now, badDispatch, badHalt>>
 
 \* task_release, resonate.sql:767-787.  T-08.
 TaskRelease(i) ==
@@ -270,13 +295,19 @@ TaskRelease(i) ==
     /\ tasks'  = [tasks EXCEPT ![i].state = "pending", ![i].timeoutAt = now + Retry]
     /\ outbox' = IF promises[i].hasTarget
                  THEN PutExec(outbox, i, tasks[i].version) ELSE outbox
-    /\ UNCHANGED <<now, promises, callbacks, listeners, resumes, badDispatch>>
+    /\ UNCHANGED <<now, promises, callbacks, listeners, resumes, badDispatch, badHalt>>
 
 \* task_halt, resonate.sql:789-801.  T-09.
+\* resonate.sql's task_halt never loads the promise at all; the reference
+\* spec's T-09 returns 409 once the promise is logically settled, because
+\* task.get already reports such a task 'fulfilled' (resonate.sql:540-545)
+\* and halt-on-fulfilled is 409.
 TaskHalt(i) ==
     /\ tasks[i].exists
     /\ tasks[i].state \notin {"fulfilled", "halted"}
+    /\ PromiseLivenessGuard => Proj(i) = "pending"         \* spec T-09 gate
     /\ tasks' = [tasks EXCEPT ![i].state = "halted"]
+    /\ badHalt' = IF Proj(i) # "pending" THEN badHalt \cup {i} ELSE badHalt
     /\ UNCHANGED <<now, promises, callbacks, listeners, resumes, outbox, badDispatch>>
 
 \* task_continue, resonate.sql:803-819.  T-10.  Like task_create and unlike
@@ -285,17 +316,25 @@ TaskContinue(i) ==
     /\ tasks[i].exists
     /\ tasks[i].state = "halted"
     /\ promises[i].exists
+    /\ PromiseLivenessGuard => Proj(i) = "pending"         \* spec T-10 gate
     /\ tasks'  = [tasks EXCEPT ![i].state = "pending", ![i].timeoutAt = now + Retry]
     /\ outbox' = IF promises[i].hasTarget
                  THEN PutExec(outbox, i, tasks[i].version) ELSE outbox
     /\ badDispatch' = IF Proj(i) # "pending"
                       THEN badDispatch \cup {i} ELSE badDispatch
-    /\ UNCHANGED <<now, promises, callbacks, listeners, resumes>>
+    /\ UNCHANGED <<now, promises, callbacks, listeners, resumes, badHalt>>
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
 (* SECTION 6 - internal transitions driven by pg_cron                       *)
 (***************************************************************************)
+
+\* process_timeouts (:997-1012) runs process_promise_timeouts to a fixpoint
+\* before process_task_timeouts, so within the shipped driver no task-timeout
+\* handler ever runs while a promise timeout is still due.
+NoPromiseTimeoutDue ==
+    \A j \in Ids : ~(promises[j].exists /\ promises[j].state = "pending"
+                     /\ promises[j].external /\ promises[j].timeoutAt <= now)
 
 \* _on_promise_timeout, resonate.sql:890-902, reachable only through
 \* process_promise_timeouts, whose WHERE clause is _promise_timed AND
@@ -307,17 +346,21 @@ OnPromiseTimeout(i) ==
     /\ promises[i].external
     /\ promises[i].timeoutAt <= now
     /\ DoSettle(i, IF promises[i].isTimer THEN "resolved" ELSE "rejected_timedout")
-    /\ UNCHANGED <<now, badDispatch>>
+    /\ UNCHANGED <<now, badDispatch, badHalt>>
 
 \* _on_task_retry_timeout, resonate.sql:904-919.
 OnTaskRetryTimeout(i) ==
     /\ tasks[i].exists
     /\ tasks[i].state = "pending"
     /\ tasks[i].timeoutAt <= now
+    /\ SequencedDriver => NoPromiseTimeoutDue
+    /\ TimeoutLivenessGuard => Proj(i) = "pending"         \* spec gate (3e8a1d6)
     /\ tasks'  = [tasks EXCEPT ![i].timeoutAt = now + Retry]
     /\ outbox' = IF promises[i].exists /\ promises[i].hasTarget
                  THEN PutExec(outbox, i, tasks[i].version) ELSE outbox
-    /\ UNCHANGED <<now, promises, callbacks, listeners, resumes, badDispatch>>
+    /\ badDispatch' = IF promises[i].exists /\ promises[i].hasTarget /\ Proj(i) # "pending"
+                      THEN badDispatch \cup {i} ELSE badDispatch
+    /\ UNCHANGED <<now, promises, callbacks, listeners, resumes, badHalt>>
 
 \* _on_task_lease_timeout, resonate.sql:921-937.  Note the version is *not*
 \* bumped: the fence token survives the lease.
@@ -325,10 +368,14 @@ OnTaskLeaseTimeout(i) ==
     /\ tasks[i].exists
     /\ tasks[i].state = "acquired"
     /\ tasks[i].timeoutAt <= now
+    /\ SequencedDriver => NoPromiseTimeoutDue
+    /\ TimeoutLivenessGuard => Proj(i) = "pending"         \* spec gate (3e8a1d6)
     /\ tasks'  = [tasks EXCEPT ![i].state = "pending", ![i].timeoutAt = now + Retry]
     /\ outbox' = IF promises[i].exists /\ promises[i].hasTarget
                  THEN PutExec(outbox, i, tasks[i].version) ELSE outbox
-    /\ UNCHANGED <<now, promises, callbacks, listeners, resumes, badDispatch>>
+    /\ badDispatch' = IF promises[i].exists /\ promises[i].hasTarget /\ Proj(i) # "pending"
+                      THEN badDispatch \cup {i} ELSE badDispatch
+    /\ UNCHANGED <<now, promises, callbacks, listeners, resumes, badHalt>>
 
 -----------------------------------------------------------------------------
 (***************************************************************************)
@@ -339,12 +386,12 @@ OnTaskLeaseTimeout(i) ==
 Dequeue(m) ==
     /\ m \in outbox
     /\ outbox' = outbox \ {m}
-    /\ UNCHANGED <<now, promises, tasks, callbacks, listeners, resumes, badDispatch>>
+    /\ UNCHANGED <<now, promises, tasks, callbacks, listeners, resumes, badDispatch, badHalt>>
 
 Tick ==
     /\ now < MaxTime
     /\ now' = now + 1
-    /\ UNCHANGED <<core, badDispatch>>
+    /\ UNCHANGED <<core, badDispatch, badHalt>>
 
 -----------------------------------------------------------------------------
 Init ==
@@ -357,6 +404,7 @@ Init ==
     /\ outbox     = {}
     /\ obs        = [i \in Ids |-> "none"]
     /\ badDispatch = {}
+    /\ badHalt     = {}
 
 Step ==
     \/ \E i \in Ids, toat \in 1..MaxTime, k \in Kinds : PromiseCreate(i, toat, k)
@@ -447,6 +495,12 @@ NoStrandedTask ==
   against, a promise that is already observably dead.
  --------------------------------------------------------------------------*)
 NoDeadDispatch == badDispatch = {}
+
+(*--------------------------------------------------------------------------
+  INV-7  A task is never halted once task.get would already report it
+  'fulfilled' -- the wire must not contradict itself.
+ --------------------------------------------------------------------------*)
+NoHaltOnDead == badHalt = {}
 
 (*--------------------------------------------------------------------------
   INV-5  Promise/task coherence: once the driver has caught up, a settled

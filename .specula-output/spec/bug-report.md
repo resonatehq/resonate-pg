@@ -15,22 +15,48 @@ Specula Phase 3 output. Spec: `.specula-output/spec/base.tla` (model of
 | `Retry` | 1 | `_retry_timeout()` |
 | `Ttl` | 1 | lease ttl |
 
-BFS, 4 workers, exhaustive within the constraint. Complete state graph:
-**3,830,244 distinct states, depth 22**.
+The model carries four switches selecting between `resonate.sql` as shipped and
+the guards the reference specification requires (see `../spec-comparison.md`):
 
-## Results
+| constant | `MC.cfg` (shipped) | `MC_fixed.cfg` (spec) |
+|---|---|---|
+| `ListenerExternalGuard` | FALSE | TRUE |
+| `PromiseLivenessGuard` | FALSE | TRUE |
+| `TimeoutLivenessGuard` | FALSE | TRUE |
+| `SequencedDriver` | TRUE — models `process_timeouts` (:997-1012) | FALSE |
 
-| Invariant | Verdict | States generated | Distinct |
-|---|---|---|---|
-| `Stickiness` | ✅ holds (exhaustive) | 25,699,032 | 3,830,244 |
-| `TaskPromiseCoherence` | ✅ holds (exhaustive) | 25,699,032 | 3,830,244 |
-| `CallbacksAreExternal` | ✅ holds (exhaustive) | 25,699,032 | 3,830,244 |
-| `NoStrandedTask` | ✅ holds (exhaustive) | 25,699,032 | 3,830,244 |
-| `NoStrandedListener` | ❌ **violated** (6-state trace, depth 6) | 100,311 | 39,648 |
-| `NoDeadDispatch` | ❌ **violated** (4-state trace, depth 8 search) | 2,965 | 1,830 |
+BFS, 4 workers, exhaustive within the constraint. Complete state graph for the
+shipped configuration: **4,687,180 distinct states, depth 22**.
 
-Four of the six properties hold across the whole reachable state space. Two are
-violated, both by short traces, both instances of Scenario 1 in the modeling brief.
+## Results — `resonate.sql` as shipped
+
+| Invariant | Verdict | Distinct states |
+|---|---|---|
+| `Stickiness` | ✅ holds (exhaustive) | 4,687,180 |
+| `TaskPromiseCoherence` | ✅ holds (exhaustive) | 4,687,180 |
+| `CallbacksAreExternal` | ✅ holds (exhaustive) | 4,687,180 |
+| `NoStrandedTask` | ✅ holds (exhaustive) | 4,687,180 |
+| `NoStrandedListener` | ❌ **violated**, 6-state trace | 41,923 |
+| `NoDeadDispatch` | ❌ **violated**, 4-state trace | 1,579 |
+| `NoHaltOnDead` | ❌ **violated** | 1,545 |
+
+## Results — the reference spec's guards applied
+
+| Configuration | Verdict | Distinct states |
+|---|---|---|
+| `MC_fixed.cfg` — every spec guard on, driver unsequenced | ✅ **all seven invariants hold, exhaustive** | 1,300,644 |
+| `MC_timeout_gap.cfg` — every guard on *except* the timeout handlers, unsequenced | ❌ `NoDeadDispatch` violated | 1,518 |
+| `MC_timeout_sequenced.cfg` — same, with `process_timeouts`' ordering restored | ✅ holds (exhaustive) | 1,300,644 |
+
+The first row is the load-bearing one: **applying the reference specification's
+guards closes every violation this model can express**, verified over the whole
+reachable state space rather than argued.
+
+The last two rows isolate BUG-5. With the timeout handlers ungated the model
+finds the doomed dispatch; restoring only `process_timeouts`' promise-loop-first
+ordering makes it unreachable again. That is the model-level statement of what
+`repro.sql` shows empirically: in `resonate.sql` the site is guarded by sequencing
+rather than by a predicate.
 
 ## Case C-1 — `NoStrandedListener` violated
 
@@ -82,12 +108,31 @@ shape and additionally emits an execute (:816).
 
 **Case classification**: **Case C** — real bug.
 
+## Case C-3 — `NoHaltOnDead` violated
+
+`task_halt` (:789-801) never loads the promise: it branches only on the stored
+task state. `task_get` (:540-545) *does* project, reporting a task `fulfilled` as
+soon as its promise is no longer effectively pending. So the model reaches a state
+where `task.get` would answer `fulfilled` — for which halt is defined to be 409
+(:796) — and `TaskHalt` is nonetheless enabled and succeeds.
+
+The reference spec's T-09 gates on the promise and names the principle:
+"Branching on the raw stored task here would make the stored-vs-projected
+divergence observable — the one thing the projection discipline forbids."
+
+**Case classification**: **Case C** — real bug. Reproduced on a live database as
+BUG-4.
+
 ## Notes on the properties that held
 
-- `Stickiness` holding is a meaningful positive result: across 3.8M states, no
-  interleaving of settle / fulfill / timeout / claim lets a client read a promise
-  as settled and later read it as anything else. The `state`+`timeout_at` guard at
-  :461 and :759 and the sticky-terminal echo are doing their job.
+- `Stickiness` holding is a meaningful positive result *for the projection*:
+  across 4.7M states, no interleaving of settle / fulfill / timeout / claim lets a
+  client read a promise as settled and later read it as anything else. The
+  `state`+`timeout_at` guard at :461 and :759 and the sticky-terminal echo are
+  doing their job. **But see the first limitation below** — this model states
+  stickiness over `Proj(i)`, not over what each handler actually returns, and
+  `task_create` returns an unprojected record (:596-597). Stickiness holds here
+  and is nonetheless falsifiable on the wire.
 - `NoStrandedTask` holding means MC-4 in the brief (dropped wakeup) is **refuted**
   within this model: the `_enqueue_resume` / `task_suspend` resume-row deletions do
   not strand a suspended task. The 300-response path at :723-726 is what saves it —
@@ -103,6 +148,12 @@ shape and additionally emits an execute (:816).
 
 ## Limitations
 
+- **Responses are not modelled.** `obs` records the projection `Proj(i)`, not the
+  payload each handler serves. A handler that returns a *raw* promise record is
+  therefore invisible to `Stickiness` — which is exactly the defect
+  `task_create` has (:596-597, `_promise_json_raw`) and which the reference spec
+  fixes by projecting in T-02. Modelling response payloads is the right next
+  extension, and is what the reference's own stability theorem does.
 - Two ids, one address, horizon 3. Bugs needing three interacting promises or a
   longer causal chain are out of reach.
 - Schedules (S-01..S-04) and cron parsing are not modelled (see brief § 3.2).
