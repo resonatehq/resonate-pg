@@ -231,6 +231,58 @@ BEGIN
 END $$;
 
 -- =============================================================================
+-- #13 · the cascade does not wake an awaiter whose own promise is dead
+-- =============================================================================
+\echo ''
+\echo '--- #13 the resume site respects TIMEOUT ALWAYS WINS'
+DO $$
+DECLARE execs int;
+BEGIN
+  PERFORM pg_temp.reset();
+  -- a dies at 1; b is driven from outside and stays alive
+  PERFORM pg_temp.status('promise.create',
+      '{"id":"a","timeoutAt":1,"tags":{"resonate:target":"poll://any@w1"}}', 0);
+  PERFORM pg_temp.status('promise.create',
+      '{"id":"b","timeoutAt":900000,"tags":{"resonate:external":"true"}}', 0);
+  PERFORM pg_temp.eq(pg_temp.status('task.acquire',
+      '{"id":"a","version":0,"pid":"w1","ttl":1}', 0), 200, 'a acquired');
+  PERFORM pg_temp.eq(pg_temp.status('task.suspend',
+      '{"id":"a","version":1,"actions":[{"data":{"awaited":"b"}}]}', 0), 200,
+      'a parks on b');
+  DELETE FROM resonate.outbox;
+
+  -- now = 5: a is long dead, the driver has not run. Settling b must not
+  -- put a back into circulation.
+  PERFORM pg_temp.eq(pg_temp.status('promise.settle',
+      '{"id":"b","state":"resolved"}', 5), 200, 'b settles');
+  SELECT count(*) INTO execs FROM resonate.outbox WHERE kind = 'execute';
+  PERFORM pg_temp.eq(execs, 0, '#13 no execute for the dead awaiter');
+  PERFORM pg_temp.eq((SELECT state FROM resonate.tasks WHERE id = 'a'), 'suspended',
+      '#13 the dead awaiter is left for its own promise timeout');
+
+  -- and that timeout does clean it up
+  PERFORM resonate.process_timeouts(6);
+  PERFORM pg_temp.eq((SELECT state FROM resonate.tasks WHERE id = 'a'), 'fulfilled',
+      '#13 cleanup belongs to the promise timeout');
+
+  -- a LIVE awaiter is still woken (the happy path this must not disturb)
+  PERFORM pg_temp.reset();
+  PERFORM pg_temp.status('promise.create',
+      '{"id":"a","timeoutAt":900000,"tags":{"resonate:target":"poll://any@w1"}}', 0);
+  PERFORM pg_temp.status('promise.create',
+      '{"id":"b","timeoutAt":900000,"tags":{"resonate:external":"true"}}', 0);
+  PERFORM pg_temp.status('task.acquire', '{"id":"a","version":0,"pid":"w1","ttl":1}', 0);
+  PERFORM pg_temp.status('task.suspend',
+      '{"id":"a","version":1,"actions":[{"data":{"awaited":"b"}}]}', 0);
+  DELETE FROM resonate.outbox;
+  PERFORM pg_temp.status('promise.settle', '{"id":"b","state":"resolved"}', 5);
+  PERFORM pg_temp.eq((SELECT state FROM resonate.tasks WHERE id = 'a'), 'pending',
+      'a LIVE awaiter is still resumed');
+  SELECT count(*) INTO execs FROM resonate.outbox WHERE kind = 'execute';
+  PERFORM pg_temp.eq(execs, 1, 'and still redispatched');
+END $$;
+
+-- =============================================================================
 -- Happy paths — the behaviour the guards must not disturb
 -- =============================================================================
 \echo ''

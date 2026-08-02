@@ -244,10 +244,16 @@ $$;
 
 CREATE OR REPLACE FUNCTION _enqueue_resume(p_awaited text, p_awaiter text, now bigint)
   RETURNS void LANGUAGE plpgsql AS $$
-DECLARE t tasks; tgt text;
+DECLARE t tasks; pw promises;
 BEGIN
   SELECT * INTO t FROM tasks WHERE id = p_awaiter FOR UPDATE;
   IF NOT FOUND THEN RETURN; END IF;
+  SELECT * INTO pw FROM promises WHERE id = p_awaiter;
+  IF NOT FOUND THEN RETURN; END IF;
+  -- TIMEOUT ALWAYS WINS at the resume site too: an awaiter whose OWN promise
+  -- is already logically settled is dead weight. It is neither woken nor
+  -- buffered -- its cleanup belongs to its own promise-timeout transition.
+  IF pw.state <> 'pending' OR pw.timeout_at <= now THEN RETURN; END IF;
 
   IF t.state = 'suspended' THEN
     UPDATE tasks SET state = 'pending',
@@ -255,9 +261,8 @@ BEGIN
     DELETE FROM task_resumes WHERE task_id = t.id;
     INSERT INTO task_resumes (task_id, awaited_id) VALUES (t.id, p_awaited)
       ON CONFLICT DO NOTHING;
-    SELECT target INTO tgt FROM promises WHERE id = p_awaiter;
-    IF tgt IS NOT NULL THEN
-      PERFORM _emit_execute(tgt, t.id, t.version);
+    IF pw.target IS NOT NULL THEN
+      PERFORM _emit_execute(pw.target, t.id, t.version);
     END IF;
   ELSIF t.state IN ('pending', 'acquired', 'halted') THEN
     INSERT INTO task_resumes (task_id, awaited_id) VALUES (t.id, p_awaited)
