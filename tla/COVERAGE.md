@@ -20,14 +20,14 @@ does.
 | convex BUG-1 | timed-out workflow resurrected and dispatched | ✅ `NoDeadDispatch` | ⚠️ its trace refuses EARLIER, for the waiter rule |
 | convex BUG-2 | `debug.*` protocol surface unauthenticated | ❌ **out of scope** — not protocol state | ❌ |
 | convex (new) | over-arms: every promise gets a durable timeout | ✅ `ArmingIsExternalOnly` | ❌ no trace exercises it |
-| pg BUG-1 | listener on an internal promise never notified | ✅ `ObligationsAreDischargeable` | ❌ its listener is on a timer (external) |
-| pg BUG-2 | `task.create` leases against a dead promise | ✅ `NoDeadDispatch` | ❌ |
-| pg BUG-2 (response half) | `task.create` serves the unprojected row | ✅ `ResponsesAreProjected` | ❌ no harness records responses |
-| pg BUG-2b | `task.continue` ungated | ✅ `NoDeadDispatch` | ❌ |
+| pg BUG-1 | listener on an internal promise never notified | ✅ `ObligationsAreDischargeable` | ✅ `pg-bug_stranded_listener` refuses at `RegisterListener` |
+| pg BUG-2 | `task.create` leases against a dead promise | ✅ `NoDeadDispatch` | ✅ `pg-bug_dead_claim` refuses at `TaskClaim` |
+| pg BUG-2 (response half) | `task.create` serves the unprojected row | ✅ `ResponsesAreProjected` (compound mutation, see MUTATIONS.md) | ❌ no harness records responses |
+| pg BUG-2b | `task.continue` ungated | ✅ `NoDeadDispatch` | ❌ no trace yet |
 | pg BUG-3 | `resonate:target = ''` dispatched once, never redelivered | ❌ **not modelled** — target is a tag, not a string | ❌ |
-| pg BUG-4 | `task.halt` 200 on a task `task.get` calls fulfilled | ✅ `NoHaltOnDead` | ❌ |
-| pg BUG-5 | timeout handlers redispatch a dead workflow | ✅ `NoDeadDispatch` | ❌ |
-| cross-cutting | the resume gap all three models share | ✅ `NoDeadDispatch` | ⚠️ as convex BUG-1 |
+| pg BUG-4 | `task.halt` 200 on a task `task.get` calls fulfilled | ✅ `NoHaltOnDead` | ✅ `pg-bug_halt_on_dead` refuses at `TaskHalt` |
+| pg BUG-5 | timeout handlers redispatch a dead workflow | ✅ `NoDeadDispatch` | ✅ `pg-bug_dead_redispatch` refuses at `OnTaskRetryTimeout` |
+| cross-cutting | the resume gap all three models share | ✅ `NoDeadDispatch` | ✅ `pg-bug_resume_dead_awaiter` refuses at `PromiseSettle` — resonate-pg [#13](https://github.com/resonatehq/resonate-pg/issues/13) |
 | cross-cutting | waiters on internal promises | ✅ `ObligationsAreDischargeable` | ✅ 4 traces refuse |
 
 ## The two answers
@@ -71,3 +71,35 @@ In order of value:
    never be trace-detected as things stand.
 3. **A fencing mutation.** No mutation here targets `AtMostOneValidClaim`,
    the one property nothing else in this family can even state.
+
+---
+
+## Update: the detection gap is closed for resonate-pg
+
+`COVERAGE.md` said the gap worth closing was *"traces that exercise the bug
+conditions"*. Done. The five call lists in `scenarios/` were scripted against a
+real Postgres in this repo's harness, recorded, adapted and replayed:
+
+```
+  pg-bug_dead_claim            REFUSED at 2/2: TaskClaim (now=1)
+  pg-bug_dead_redispatch       REFUSED at 2/2: OnTaskRetryTimeout (now=1)
+  pg-bug_halt_on_dead          REFUSED at 2/2: TaskHalt (now=1)
+  pg-bug_resume_dead_awaiter   REFUSED at 5/5: PromiseSettle (now=5)
+  pg-bug_stranded_listener     REFUSED at 3/4: RegisterListener (now=0)
+  ...the five happy-path traces remain CONFORMANT
+```
+
+`refusal-point.sh` produces those lines: it replays growing prefixes and names
+the first event the specification cannot take.
+
+**`pg-bug_resume_dead_awaiter` was a new bug.** The implementation-specific
+model that preceded this one instrumented `badDispatch` at `task.create`,
+`task.continue` and the two timeout handlers — but not at the settlement
+cascade — so it could not see the resume gap in resonate-pg, and the five
+issues filed from it (#8-#12) do not include it. One `NoDeadDispatch` covering
+every site did. Filed as
+[#13](https://github.com/resonatehq/resonate-pg/issues/13) and fixed.
+
+Two rows remain ❌ for reasons this work did not change: pg BUG-2b needs one
+more scripted scenario, and the three response-level rows need a harness that
+records what an RPC returned.

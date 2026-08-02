@@ -130,3 +130,32 @@ This is the cost of dropping the profiles, stated plainly: the old
 `MC_pg.cfg` model-checked resonate-pg's *semantics* exhaustively and found
 `NoHaltOnDead` across the whole reachable space. Nothing does that now,
 because the model no longer has a way to express "resonate-pg's semantics".
+
+## Compound mutations
+
+A single-edit mutation can be **vacuous**: if another guard in the same action
+already implies the mutated expression, removing it changes nothing and the
+mutation "survives" for a reason that says nothing about the property set.
+
+`task.create serves raw row` was exactly that. T-02's own `Live(i)` guard means
+`Proj(i)` and `promises[i].state` are equal wherever the claim can fire, so
+serving the raw row had no observable effect and the run reported
+`!! SURVIVES -- nothing caught it`. That reading was wrong twice over: the
+property exists, and the defect is real — resonate-pg has it — but only in
+combination with the missing guard, which resonate-pg also has.
+
+Run as a compound (`m6 && m10`) the defect is observable, and `NoDeadDispatch`
+then fires *first* at depth 4, masking the response property. So `mut2` takes
+several edits and one invariant to check in isolation:
+
+```bash
+mut2 "task.create serves raw row (with m6)" \
+     '<guard edit>&&&<response edit>' m10 ResponsesAreProjected
+```
+
+Result: `ResponsesAreProjected` violated in 4 states. **No mutation survives.**
+
+The general lesson: a surviving mutation has three possible causes, and they
+need different responses — the property set is too weak (fix the model), the
+mutation is masked by an earlier-firing property (isolate the invariant), or
+the mutation is vacuous against a sibling guard (make it compound).

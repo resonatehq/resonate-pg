@@ -1,0 +1,237 @@
+
+=== BUG-1: listener stranded on an internal promise ===
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+ listener_status 
+-----------------
+ 200
+(1 row)
+
+ awaiter_created 
+-----------------
+ 200
+(1 row)
+
+ callback_status_expect_422 
+----------------------------
+ 422
+(1 row)
+
+ driver_processed 
+------------------
+                1
+(1 row)
+
+ row_state | promise_get_reports | listeners_still_registered | unblock_messages_emitted 
+-----------+---------------------+----------------------------+--------------------------
+ pending   | rejected_timedout   |                          1 |                        0
+(1 row)
+
+                                    result                                     
+-------------------------------------------------------------------------------
+ BUG-1 REPRODUCED: promise.get says rejected_timedout, listener never notified
+(1 row)
+
+ gc_collected_expect_0 
+-----------------------
+                     0
+(1 row)
+
+
+=== BUG-2: task.create claims a lease on an already-dead promise ===
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+ acquire_status_expect_409 
+---------------------------
+ 409
+(1 row)
+
+ create_status_expect_409 
+--------------------------
+ 200
+(1 row)
+
+  state   | version | pid 
+----------+---------+-----
+ acquired |       1 | w2
+(1 row)
+
+ task_state | promise_get_reports | fulfill_status 
+------------+---------------------+----------------
+ acquired   | rejected_timedout   | 409
+(1 row)
+
+                                                         result                                                          
+-------------------------------------------------------------------------------------------------------------------------
+ BUG-2 REPRODUCED: task.acquire 409 but task.create granted the lease; the run's result is then rejected at task.fulfill
+(1 row)
+
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+ halt_status 
+-------------
+ 200
+(1 row)
+
+ continue_status_expect_409 
+----------------------------
+ 200
+(1 row)
+
+                                 result                                  
+-------------------------------------------------------------------------
+ BUG-2b REPRODUCED: task.continue re-dispatched an already-dead workflow
+(1 row)
+
+
+=== BUG-3: empty resonate:target creates an undeliverable task ===
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+  id   |  state  | version | timeout_at 
+-------+---------+---------+------------
+ empty | pending |       0 |       6000
+(1 row)
+
+  key  |  kind   | address 
+-------+---------+---------
+ empty | execute | <>
+(1 row)
+
+ tick1 
+-------
+     1
+(1 row)
+
+ tick2 
+-------
+     1
+(1 row)
+
+ tick3 
+-------
+     1
+(1 row)
+
+ task_state | outbox_after_3_retries 
+------------+------------------------
+ pending    |                      0
+(1 row)
+
+                              result                               
+-------------------------------------------------------------------
+ BUG-3 REPRODUCED: task pending forever, retry timer emits nothing
+(1 row)
+
+
+
+=== BUG-4: task.halt on a task task.get calls fulfilled ===
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+ task_get_reports | halt_status | task_row_after 
+------------------+-------------+----------------
+ fulfilled        | 200         | pending
+(1 row)
+
+                                                     result                                                     
+----------------------------------------------------------------------------------------------------------------
+ BUG-4 REPRODUCED: task.get says fulfilled (halt-on-fulfilled is 409), yet task.halt returned 200 and halted it
+(1 row)
+
+
+=== BUG-5: task timeout handlers redispatch a dead workflow ===
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+ acquire_status 
+----------------
+ 200
+(1 row)
+
+ task_loop_processed 
+---------------------
+                   1
+(1 row)
+
+ execute_msgs | task_state | promise_row 
+--------------+------------+-------------
+            1 | pending    | pending
+(1 row)
+
+                                  result                                  
+--------------------------------------------------------------------------
+ BUG-5 REPRODUCED (via process_task_timeouts): dead workflow redispatched
+(1 row)
+
+ reset 
+-------
+ 
+(1 row)
+
+ create_status 
+---------------
+ 200
+(1 row)
+
+ acquire_status 
+----------------
+ 200
+(1 row)
+
+ full_driver_processed 
+-----------------------
+                     1
+(1 row)
+
+                                   result                                   
+----------------------------------------------------------------------------
+ BUG-5 MASKED via process_timeouts: ordering, not a guard, is what saves it
+(1 row)
+
+

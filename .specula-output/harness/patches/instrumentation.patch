@@ -1,0 +1,130 @@
+--- /home/user/resonate-pg/resonate.sql	2026-08-01 18:41:06.498565269 +0000
++++ /home/user/resonate-pg/.specula-output/harness/build/resonate-instrumented.sql	2026-08-02 00:25:52.124754240 +0000
+@@ -421,6 +421,7 @@
+       END IF;
+       INSERT INTO tasks (id, state, version, timeout_at) VALUES (p.id, 'pending', 0, delay);
+     END IF;
++    PERFORM _trace_emit('PromiseCreate', p_now);
+     RETURN jsonb_build_object('status', 200, 'promise', _promise_json(p, p_now));
+   ELSE
+     st := CASE WHEN COALESCE(tags->>'resonate:timer','') = 'true'
+@@ -432,6 +433,7 @@
+     IF tags ? 'resonate:target' THEN
+       INSERT INTO tasks (id, state, version) VALUES (p.id, 'fulfilled', 0);
+     END IF;
++    PERFORM _trace_emit('PromiseCreate', p_now);
+     RETURN jsonb_build_object('status', 200, 'promise', _promise_json(p, p_now));
+   END IF;
+ EXCEPTION WHEN unique_violation THEN
+@@ -464,6 +466,7 @@
+      WHERE id = p.id
+      RETURNING * INTO p;
+     PERFORM _cascade_settle(p, p_now);
++  PERFORM _trace_emit('PromiseSettle', p_now);
+   END IF;
+   RETURN jsonb_build_object('status', 200, 'promise', _promise_json(p, p_now));
+ END $$;
+@@ -492,6 +495,7 @@
+       IF pw.state = 'pending' AND pw.timeout_at > p_now THEN
+         INSERT INTO callbacks (awaited_id, awaiter_id) VALUES (p_awaited, p_awaiter)
+           ON CONFLICT DO NOTHING;
++      PERFORM _trace_emit('RegisterCallback', p_now);
+       END IF;
+     END IF;
+   END IF;
+@@ -515,6 +519,7 @@
+   IF pa.state = 'pending' AND pa.timeout_at > p_now THEN
+     INSERT INTO listeners (awaited_id, address) VALUES (p_awaited, p_address)
+       ON CONFLICT DO NOTHING;
++  PERFORM _trace_emit('RegisterListener', p_now);
+   END IF;
+   RETURN jsonb_build_object('status', 200, 'promise', _promise_json(pa, p_now));
+ END $$;
+@@ -589,6 +594,7 @@
+       DELETE FROM task_resumes WHERE task_id = t.id;
+       UPDATE tasks SET state = 'acquired', version = version + 1, ttl = p_ttl, pid = p_pid,
+                        timeout_at = p_now + p_ttl WHERE id = t.id RETURNING * INTO t;
++    PERFORM _trace_emit('TaskClaim', p_now);
+     ELSE
+       RETURN jsonb_build_object('status', 409);
+     END IF;
+@@ -617,6 +623,7 @@
+   UPDATE tasks SET state = 'acquired', version = version + 1, ttl = p_ttl, pid = p_pid,
+                    timeout_at = p_now + p_ttl
+     WHERE id = t.id RETURNING * INTO t;
++  PERFORM _trace_emit('TaskAcquire', p_now);
+   RETURN jsonb_build_object('status', 200, 'task', _task_json(t),
+                             'promise', _promise_json(p, p_now));
+ END $$;
+@@ -722,6 +729,7 @@
+   IF internal THEN RETURN jsonb_build_object('status', 422); END IF;
+   IF settled THEN
+     DELETE FROM task_resumes WHERE task_id = t.id;
++    PERFORM _trace_emit('TaskSuspend300', p_now);
+     RETURN jsonb_build_object('status', 300);
+   END IF;
+ 
+@@ -731,6 +739,7 @@
+   ON CONFLICT DO NOTHING;
+   DELETE FROM task_resumes WHERE task_id = t.id;
+   UPDATE tasks SET state = 'suspended', pid = NULL, ttl = NULL WHERE id = t.id;
++  PERFORM _trace_emit('TaskSuspend', p_now);
+   RETURN jsonb_build_object('status', 200);
+ END $$;
+ 
+@@ -761,6 +770,7 @@
+   UPDATE promises SET state = a_state, value_headers = a_headers, value_data = a_data,
+                       settled_at = p_now WHERE id = p.id RETURNING * INTO p;
+   PERFORM _cascade_settle(p, p_now);
++  PERFORM _trace_emit('TaskFulfill', p_now);
+   RETURN jsonb_build_object('status', 200, 'promise', _promise_json_raw(p));
+ END $$;
+ 
+@@ -783,6 +793,7 @@
+   IF p.target IS NOT NULL AND p.target <> '' THEN
+     PERFORM _emit_execute(p.target, t.id, t.version);
+   END IF;
++  PERFORM _trace_emit('TaskRelease', p_now);
+   RETURN jsonb_build_object('status', 200);
+ END $$;
+ 
+@@ -797,6 +808,7 @@
+   IF t.state = 'halted' THEN RETURN jsonb_build_object('status', 200); END IF;
+ 
+   UPDATE tasks SET state = 'halted', pid = NULL, ttl = NULL WHERE id = t.id;
++  PERFORM _trace_emit('TaskHalt', p_now);
+   RETURN jsonb_build_object('status', 200);
+ END $$;
+ 
+@@ -815,6 +827,7 @@
+   IF p.target IS NOT NULL AND p.target <> '' THEN
+     PERFORM _emit_execute(p.target, t.id, t.version);
+   END IF;
++  PERFORM _trace_emit('TaskContinue', p_now);
+   RETURN jsonb_build_object('status', 200);
+ END $$;
+ 
+@@ -899,6 +912,7 @@
+   st := CASE WHEN p.is_timer THEN 'resolved' ELSE 'rejected_timedout' END;
+   UPDATE promises SET state = st, settled_at = p.timeout_at WHERE id = p.id RETURNING * INTO p;
+   PERFORM _cascade_settle(p, p_now);
++PERFORM _trace_emit('OnPromiseTimeout', p_now);
+ END $$;
+ 
+ CREATE OR REPLACE FUNCTION _on_task_retry_timeout(p_id text, p_now bigint) RETURNS void
+@@ -916,6 +930,7 @@
+   IF p.target IS NOT NULL AND p.target <> '' THEN
+     PERFORM _emit_execute(p.target, t.id, t.version);
+   END IF;
++PERFORM _trace_emit('OnTaskRetryTimeout', p_now);
+ END $$;
+ 
+ CREATE OR REPLACE FUNCTION _on_task_lease_timeout(p_id text, p_now bigint) RETURNS void
+@@ -934,6 +949,7 @@
+   IF p.target IS NOT NULL AND p.target <> '' THEN
+     PERFORM _emit_execute(p.target, t.id, t.version);
+   END IF;
++PERFORM _trace_emit('OnTaskLeaseTimeout', p_now);
+ END $$;
+ 
+ CREATE OR REPLACE FUNCTION _on_schedule_timeout(p_id text, p_now bigint) RETURNS void

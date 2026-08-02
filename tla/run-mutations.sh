@@ -12,6 +12,37 @@ exec 9>"$HERE/.mutate.lock"; flock -n 9 || { echo "another mutation run holds th
 cp "$HERE/Unified.tla" "$HERE/.Unified.orig"
 trap 'cp "$HERE/.Unified.orig" "$HERE/Unified.tla"; rm -f "$HERE/.Unified.orig"' EXIT
 
+# Some defects are only observable in combination, or are masked by a property
+# that fires earlier. mut2 takes several edits (joined by &&&) and one
+# invariant to check in isolation. See MUTATIONS.md, "compound mutations".
+mut2 () {
+  if ! python3 - "$2" "$HERE" <<'PYX'
+import sys
+h=sys.argv[2]; src=open(h+"/.Unified.orig").read()
+for pair in sys.argv[1].split('&&&'):
+    old,new=pair.split('|||')
+    assert src.count(old)>=1, "anchor not found: "+old[:70]
+    src=src.replace(old,new,1)
+open(h+"/Unified.tla","w").write(src)
+PYX
+  then
+    printf "  %-38s %-32s %s\n" "$1" "!! ANCHOR DID NOT APPLY" "-"
+    cp "$HERE/.Unified.orig" "$HERE/Unified.tla"
+    return
+  fi
+  sed '/^INVARIANT/,$d' "$HERE/MC.cfg" > "$HERE/.MC_iso.cfg"
+  printf 'INVARIANT\n    TypeOK\n    %s\n' "$4" >> "$HERE/.MC_iso.cfg"
+  timeout 600 java -XX:+UseParallelGC -Xmx3g -cp "$LIB/tla2tools.jar" \
+       tlc2.TLC -workers 4 -config "$HERE/.MC_iso.cfg" "$HERE/MC.tla" > /tmp/mut-$3.out 2>&1
+  local prop depth
+  prop=$(grep -oE "Invariant [A-Za-z]+ is violated" /tmp/mut-$3.out | head -1 | awk '{print $2}')
+  depth=$(grep -c "^State " /tmp/mut-$3.out)
+  [ -z "$prop" ] && { prop="!! SURVIVES -- nothing caught it"; depth="-"; }
+  printf "  %-38s %-32s %s\n" "$1" "$prop" "$depth"
+  cp "$HERE/.Unified.orig" "$HERE/Unified.tla"; rm -f "$HERE/.MC_iso.cfg"
+}
+
+
 mut () {
   if ! python3 - "$2" "$HERE" <<'PYX'
 import sys
@@ -54,4 +85,12 @@ mut "ungate task.create claim"     '    /\ Live(i)                              
 mut "ungate task.halt"             '    /\ Live(i)                                  \* spec T-09|||    /\ TRUE' m7
 mut "ungate task.continue"         '    /\ Live(i)                                  \* spec T-10|||    /\ TRUE' m8
 mut "redispatch a dead task (R6)"  '    /\ Live(i)                    \* no new work for the dead (R6)|||    /\ TRUE' m9
-mut "task.create serves raw row"   '    /\ RespondP(i, Proj(i))|||    /\ RespondP(i, promises[i].state)' m10
+# m10 alone is VACUOUS: T-02's own Live(i) guard means Proj(i) and the stored
+# state are equal wherever the claim can fire, so serving the raw row has no
+# observable effect. It is resonate-pg's defect only in combination with the
+# missing guard (m6) -- which is exactly resonate-pg's situation -- and even
+# then NoDeadDispatch fires first, so the response property has to be checked
+# on its own.
+mut2 "task.create serves raw row (with m6)" \
+     '    /\ Live(i)                                  \* 409 -- spec T-02|||    /\ TRUE&&&    /\ RespondP(i, Proj(i))|||    /\ RespondP(i, promises[i].state)' \
+     m10 ResponsesAreProjected

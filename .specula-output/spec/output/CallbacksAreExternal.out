@@ -1,0 +1,40 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/root/.ccr/java-truststore.p12 -Djavax.net.ssl.trustStorePassword=changeit -Djavax.net.ssl.trustStoreType=PKCS12 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=39133 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|anthropic.com|*.anthropic.com|*.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+TLC2 Version 2026.07.31.184830 (rev: 30cc360)
+Running breadth-first search Model-Checking with fp 7 and seed 1284626894837894782 with 4 workers on 4 cores with 2731MB heap and 64MB offheap memory [pid: 15984] (Linux 6.18.5 amd64, Ubuntu 21.0.10 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/user/resonate-pg/.specula-output/spec/MC.tla
+Parsing file /home/user/resonate-pg/.specula-output/spec/base.tla
+Parsing file /tmp/tlc-449738829846608055/_TLCTrace.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /tmp/tlc-449738829846608055/Naturals.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /tmp/tlc-449738829846608055/FiniteSets.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /tmp/tlc-449738829846608055/Sequences.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /tmp/tlc-449738829846608055/TLC.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /tmp/tlc-449738829846608055/TLCExt.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /tmp/tlc-449738829846608055/Integers.tla (jar:file:/tmp/claude-0/-home-user-resonate-pg/bcceee89-506c-5386-bae1-87e85efc1c94/scratchpad/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module base
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MC
+Linting of module base
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MC
+Starting... (2026-08-01 17:36:04)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-08-01 17:36:04.
+Progress(9) at 2026-08-01 17:36:07: 240,242 states generated (240,242 s/min), 83,480 distinct states found (83,480 ds/min), 51,724 states left on queue.
+Progress(15) at 2026-08-01 17:37:07: 13,226,572 states generated (12,986,330 s/min), 2,741,331 distinct states found (2,657,851 ds/min), 687,893 states left on queue.
+Progress(17) at 2026-08-01 17:38:07: 24,946,332 states generated (11,719,760 s/min), 4,402,551 distinct states found (1,661,220 ds/min), 327,443 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 6.0E-6
+  based on the actual fingerprints:  val = 2.9E-7
+28137484 states generated, 4687180 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 22.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 25 and the 95th percentile is 3).
+Finished in 02min 19s at (2026-08-01 17:38:23)
