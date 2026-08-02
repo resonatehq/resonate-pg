@@ -1,0 +1,9 @@
+states/
+*.st
+*.fp
+*_TTrace_*
+.tla-lib/
+UTrace.cfg
+.Unified.orig
+.mutate.lock
+output/
