@@ -5,6 +5,10 @@
 
 # Resonate on Postgres
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+## About this component
+
 **Dead simple durable execution.**
 
 Resonate durable execution runs your code as a reliable workflow, checkpointing each step as a durable promise, sleeping for days, surviving crashes and restarts. resonate-pg is one SQL file. No additional servers, queues, or timers — Postgres, with pg_cron, is all three. Full Resonate docs live at [docs.resonatehq.io](https://docs.resonatehq.io).
@@ -31,28 +35,41 @@ Crash the process, redeploy, or lose the machine mid-run — the workflow resume
   <img alt="Quickstart" src="./assets/quickstart-banner-light.png">
 </picture>
 
-## Getting started
+## Requirements
 
-resonate-pg is a Resonate Server in a single file running on Postgres 16+:
+- Postgres 16+
+- `pg_cron` — required; it drives all timers
+- `pg_net` or `pgsql_http` — optional; either one enables HTTP push delivery
+
+## Install
+
+resonate-pg is a Resonate server in a single file. Apply it to a database:
 
 ```bash
 psql -d yourdb -f resonate.sql
 ```
 
-**Extensions**
+There is no binary to run and no process to supervise. Postgres is the server.
 
-- pg_cron *(required — drives all timers)*
-- pg_net or pgsql_http *(optional — either one enables HTTP push delivery)*
+## Connecting workers
 
-## SDK
+Every protocol action is a stored procedure, reached through the `resonate_rpc` dispatcher rather than an HTTP URL:
 
-You write workflows with a Resonate SDK:
+```sql
+SELECT resonate.resonate_rpc('{"kind":"promise.get","head":{},"data":{"id":"invoke:foo"}}');
+```
 
-- [TypeScript](https://github.com/resonatehq/resonate-sdk-ts)
-- [Python](https://github.com/resonatehq/resonate-sdk-py)
-- [Go](https://github.com/resonatehq/resonate-sdk-go)
-- [Java](https://github.com/resonatehq/resonate-sdk-java)
-- [Rust](https://github.com/resonatehq/resonate-sdk-rs)
+So a worker needs a client that speaks to that function over a Postgres connection. The path demonstrated in this repository is the Supabase TypeScript client:
+
+```typescript
+import { type Context, Resonate } from "jsr:@resonatehq/supabase@0.4.1";
+
+const resonate = new Resonate();
+```
+
+Both examples under [`example/`](example) use it. See [`example/countdown`](example/countdown) for a full deployment, empty project to running workflow.
+
+`test/conformance.py` shows the other shape: a shim that puts an HTTP interface in front of `resonate_rpc`. It exists to let the conformance harness drive the database and is not a shipped client, but it is the pattern an HTTP-based SDK client would need.
 
 ## Operations
 
@@ -68,11 +85,26 @@ Keep the horizon longer than any window in which you might re-send the same work
 
 ## Under the hood
 
-resonate-pg is a faithful implementation of the Resonate protocol: every protocol action is a stored procedure, callable via resonate_rpc:
+resonate-pg is a faithful implementation of the Resonate protocol. Every protocol action is a stored procedure; `resonate_rpc` is the wire dispatcher in front of them, and `pg_cron` fires the timers. No additional servers, queues, or timers — Postgres, with pg_cron, is all three.
 
-```sql
-SELECT resonate.resonate_rpc('{"kind":"promise.get","head":{},"data":{"id":"invoke:foo"}}');
+## How it's tested
+
+`test/conformance.py` is a shim that puts an HTTP interface in front of `resonate_rpc`, so the external Resonate conformance harness can drive a resonate-pg database as if it were a Resonate server. It needs `psycopg`:
+
+```bash
+pip install 'psycopg[binary,pool]'
+DATABASE_URL=postgres://... python test/conformance.py
 ```
+
+The harness then runs against `RESONATE_URL=http://localhost:8001`.
+
+There is no CI workflow on this repository, so nothing runs this on push or pull request.
+
+## What's not there yet
+
+- **No CI.** The conformance suite exists but nothing runs it on push or pull request.
+- **No production reference deployments.** Nobody is running this in production yet.
+- **Delivery depends on an optional extension.** Without `pg_net` or `pgsql_http`, there is no HTTP push path.
 
 ## Community
 
