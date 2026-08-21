@@ -30,6 +30,17 @@ Crash the process, redeploy, or lose the machine mid-run — the workflow resume
 
 > **On Supabase?** [`example/countdown`](example/countdown) goes from an empty project to a running durable workflow in about five minutes.
 
+- [Read the docs](https://docs.resonatehq.io)
+- [Evaluate Resonate for your next project](https://docs.resonatehq.io/evaluate/)
+- [Resonate SDKs](https://github.com/resonatehq)
+- [Example application library](https://github.com/resonatehq-examples)
+- [Distributed Async Await — the concepts that power Resonate](https://www.distributed-async-await.io/)
+- [Join the Discord](https://resonatehq.io/discord)
+- [Subscribe to the Journal](https://journal.resonatehq.io/subscribe)
+- [Follow on X](https://x.com/resonatehqio)
+- [Follow on LinkedIn](https://www.linkedin.com/company/resonatehqio)
+- [Subscribe on YouTube](https://www.youtube.com/@resonatehqio)
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./assets/quickstart-banner.png">
   <img alt="Quickstart" src="./assets/quickstart-banner-light.png">
@@ -108,7 +119,13 @@ There is no CI workflow on this repository, so nothing runs this on push or pull
 
 ## Community
 
-Questions, ideas, or want to help? Join the [Resonate Discord](https://resonatehq.io/discord), or open an issue or pull request — contributions welcome. resonate-pg is part of [Resonate](https://github.com/resonatehq/resonate).
+Questions, ideas, or want to help? Open an issue or a pull request — contributions welcome. resonate-pg is part of [Resonate](https://github.com/resonatehq/resonate).
+
+- [Discord](https://resonatehq.io/discord)
+- [X](https://x.com/resonatehqio)
+- [LinkedIn](https://www.linkedin.com/company/resonatehqio)
+- [YouTube](https://www.youtube.com/@resonatehqio)
+- [Journal](https://journal.resonatehq.io)
 
 ## License
 
