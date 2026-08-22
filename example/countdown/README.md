@@ -1,6 +1,6 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="../../assets/resonate-banner.png">
-  <img alt="Resonate" src="../../assets/resonate-banner-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="../../assets/banner-dark.png">
+  <img alt="Resonate" src="../../assets/banner-light.png">
 </picture>
 
 # Countdown on Supabase
