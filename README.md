@@ -1,7 +1,10 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./assets/resonate-banner.png">
-  <img alt="Resonate" src="./assets/resonate-banner-light.png">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/banner-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/banner-light.png">
+    <img alt="Resonate on Postgres — Resonate" src="./assets/banner-dark.png">
+  </picture>
+</p>
 
 # Resonate on Postgres
 
@@ -41,10 +44,13 @@ Crash the process, redeploy, or lose the machine mid-run — the workflow resume
 - [Follow on LinkedIn](https://www.linkedin.com/company/resonatehqio)
 - [Subscribe on YouTube](https://www.youtube.com/@resonatehqio)
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./assets/quickstart-banner.png">
-  <img alt="Quickstart" src="./assets/quickstart-banner-light.png">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/quickstart-banner-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/quickstart-banner-light.png">
+    <img alt="Quickstart — Resonate" src="./assets/quickstart-banner-dark.png">
+  </picture>
+</p>
 
 ## Requirements
 
