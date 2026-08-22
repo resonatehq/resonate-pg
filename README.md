@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./assets/banner-dark.png">
     <source media="(prefers-color-scheme: light)" srcset="./assets/banner-light.png">
-    <img alt="Resonate on Postgres — Resonate" src="./assets/banner-dark.png">
+    <img alt="Resonate on Postgres" src="./assets/banner-dark.png">
   </picture>
 </p>
 
@@ -14,7 +14,7 @@
 
 **Dead simple durable execution.**
 
-Resonate durable execution runs your code as a reliable workflow, checkpointing each step as a durable promise, sleeping for days, surviving crashes and restarts. resonate-pg is one SQL file. No additional servers, queues, or timers — Postgres, with pg_cron, is all three. Full Resonate docs live at [docs.resonatehq.io](https://docs.resonatehq.io).
+Resonate durable execution runs your code as a reliable workflow, checkpointing each step as a durable promise, sleeping for days, surviving crashes and restarts. resonate-pg is one SQL file. No additional servers, queues, or timers — Postgres, with pg_cron, is all three. Full docs for this provider live at [docs.resonatehq.io/deploy/providers/postgres](https://docs.resonatehq.io/deploy/providers/postgres).
 
 ```ts
 resonate.register(
@@ -33,9 +33,8 @@ Crash the process, redeploy, or lose the machine mid-run — the workflow resume
 
 > **On Supabase?** [`example/countdown`](example/countdown) goes from an empty project to a running durable workflow in about five minutes.
 
-- [Read the docs](https://docs.resonatehq.io)
+- [Read the docs for this provider](https://docs.resonatehq.io/deploy/providers/postgres)
 - [Evaluate Resonate for your next project](https://docs.resonatehq.io/evaluate/)
-- [Resonate SDKs](https://github.com/resonatehq)
 - [Example application library](https://github.com/resonatehq-examples)
 - [Distributed Async Await — the concepts that power Resonate](https://www.distributed-async-await.io/)
 - [Join the Discord](https://resonatehq.io/discord)
@@ -70,7 +69,7 @@ There is no binary to run and no process to supervise. Postgres is the server.
 
 ## Connecting workers
 
-Every protocol action is a stored procedure, reached through the `resonate_rpc` dispatcher rather than an HTTP URL:
+Every protocol action is a stored function, reached through the `resonate_rpc` dispatcher rather than an HTTP URL:
 
 ```sql
 SELECT resonate.resonate_rpc('{"kind":"promise.get","head":{},"data":{"id":"invoke:foo"}}');
@@ -86,7 +85,15 @@ const resonate = new Resonate();
 
 Both examples under [`example/`](example) use it. See [`example/countdown`](example/countdown) for a full deployment, empty project to running workflow.
 
-`test/conformance.py` shows the other shape: a shim that puts an HTTP interface in front of `resonate_rpc`. It exists to let the conformance harness drive the database and is not a shipped client, but it is the pattern an HTTP-based SDK client would need.
+Despite the name, `@resonatehq/supabase` is a Postgres client rather than a Supabase-only one. It is pre-1.0; expect its surface to move.
+
+**Other languages.** There is no `resonate_rpc` client in the Python, Go, Rust, or Java SDKs, so teams on those languages can't use this provider today. `test/conformance.py` shows the shape one would take — an HTTP interface in front of `resonate_rpc` — but it exists to drive the conformance harness and is not a shipped client.
+
+Applying `resonate.sql` creates a `resonate_worker` role and revokes `EXECUTE` from `PUBLIC`, so grant it to whatever role your worker connects as:
+
+```sql
+GRANT resonate_worker TO myworker;
+```
 
 ## Operations
 
@@ -98,11 +105,26 @@ select cron.schedule('resonate-gc', '0 3 * * *',
   $$select resonate.gc((extract(epoch from now())*1000 - 7*86400000)::bigint)$$);
 ```
 
-Keep the horizon longer than any window in which you might re-send the same workflow id; ids are idempotent only while the row exists.
+`resonate.gc` deletes at most 10,000 rows per call unless you pass a higher limit as a second argument, so check it keeps up with your volume.
+
+**Garbage collection deletes your idempotency guarantee.** Workflow ids dedupe only while their row exists, so a horizon shorter than your retry window turns a duplicate submission into a second execution. Keep it longer than any window in which you might re-send the same id.
 
 ## Under the hood
 
-resonate-pg is a faithful implementation of the Resonate protocol. Every protocol action is a stored procedure; `resonate_rpc` is the wire dispatcher in front of them, and `pg_cron` fires the timers. No additional servers, queues, or timers — Postgres, with pg_cron, is all three.
+resonate-pg is a faithful implementation of the Resonate protocol. Every protocol action is a stored function; `resonate_rpc` is the wire dispatcher in front of them, and `pg_cron` fires the timers.
+
+## What's not there yet
+
+Read this before you plan a production rollout.
+
+- **Open correctness issues in the task lifecycle.** The tracker carries confirmed bugs — a task that can be halted after it reports fulfilled, a lease claimed by `task.create` that `task.acquire` then refuses as timed out, timeout handlers redispatching workflows that are already finished, and a settlement cascade that can wake an awaiter whose own promise is already dead. Read the [open issues](https://github.com/resonatehq/resonate-pg/issues) before you commit to this provider.
+- **TypeScript only.** No other SDK has a client that can reach `resonate_rpc`.
+- **The worker client is pre-1.0.** `@resonatehq/supabase` has not reached a stable release.
+- **Timers depend entirely on `pg_cron`.** There is no in-database fallback. If the cron job is unscheduled, paused, or lost in a restore, durable sleeps stop waking and nothing surfaces the failure.
+- **Retention is yours to run.** See [Operations](#operations) — completed workflows stay until you delete them, and the horizon interacts with idempotency.
+- **No horizontal story beyond Postgres's own.** Throughput, connection limits, and failover are whatever your Postgres deployment provides. There is nothing to scale independently of the database.
+- **No production reference deployments.** Nobody is running this in production yet.
+- **No CI.** The conformance shim exists but nothing runs it on push or pull request.
 
 ## How it's tested
 
@@ -116,12 +138,6 @@ DATABASE_URL=postgres://... python test/conformance.py
 The harness then runs against `RESONATE_URL=http://localhost:8001`.
 
 There is no CI workflow on this repository, so nothing runs this on push or pull request.
-
-## What's not there yet
-
-- **No CI.** The conformance suite exists but nothing runs it on push or pull request.
-- **No production reference deployments.** Nobody is running this in production yet.
-- **Delivery depends on an optional extension.** Without `pg_net` or `pgsql_http`, there is no HTTP push path.
 
 ## Community
 
