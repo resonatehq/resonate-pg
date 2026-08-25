@@ -167,6 +167,94 @@ on an internal promise, violating
 that violate `well_formed_promise_timer_not_targeted` and
 `well_formed_schedule_promise_tags_not_timer_targeted`.
 
+## Measurements
+
+`test/bench.py` runs identical workloads against three variants — the two-table
+baseline, the merged schema bare, and the merged schema with `constraints.sql`
+— and `test/report.py` cuts the result globally, by RPC kind and by response
+status. Repeats round-robin across variants and the figure is the median of
+seven, with the min/max spread printed beside it.
+
+**Read the write counters, not the clock.** This container's p50 varies ±10-45%
+between repeats, so only latency gaps wider than the printed band mean
+anything. WAL bytes, rows written and index size are deterministic and say the
+same thing more precisely.
+
+### Global — merged vs the two-table baseline (constraints off)
+
+| workload | p50 | WAL | rows written | index size |
+|---|---|---|---|---|
+| fanout | **−35%** | **−16%** | −33% | **−44%** |
+| reads | **−25%** | −12% | −33% | −24% |
+| lifecycle | **−12%** | −9% | −33% | −23% |
+| rejects | ±0% | ±0% | — | −24% |
+| listeners | +20% | **−10%** | −33% | −28% |
+| heartbeat | +23% | **+35%** | −3% | −17% |
+
+Merged writes fewer rows in every workload and less WAL in five of six. It is
+smaller on disk in all six, and the index saving is the large one — the split
+carries a primary key per obligation table, and those disappear.
+
+### Where it wins, by request kind
+
+| request | Δ p50 | why |
+|---|---|---|
+| `promise.settle` (fanout) | **−45%** | `_cascade_settle` reads the obligations out of the row it just settled instead of scanning two tables and issuing three DELETEs |
+| `task.acquire` (fanout) | **−45%** | one row lookup and one UPDATE, not two of each |
+| `task.get` | **−27%** | the `resumes` count was a correlated subquery per serialisation; now a column read |
+| `promise.get` | −12% | |
+
+The fanout gain is the interesting one, because fan-out is the shape the
+obligation tables were there to serve. 11 503 of the merged updates in that
+workload are HOT against 774 for the split: an array append touches no indexed
+column, so it can stay on the page.
+
+### Where it loses, by request kind
+
+| request | Δ p50 | Δ WAL | why |
+|---|---|---|---|
+| `task.heartbeat` | **+24%** | **+35%** | the wide row, exactly as predicted |
+| `promise.register_listener` | +21% | −10% | appending to an array is an UPDATE of a wide row; the split did an INSERT into a two-column table |
+
+**The heartbeat regression is not the payload.** The obvious mitigation — a
+lower `toast_tuple_target` to push `param_data`/`value_data` out of line — moved
+WAL by nothing at all, because a repeating payload compresses away and was
+never inline. The cost is the row's width in columns and indexes, not its
+bytes, and `expires_at` is indexed so a heartbeat can never HOT-update. The
+escape hatch, if this workload dominates, is a skinny side table for the lease
+— a five-into-two merge rather than five-into-one — at the price of the four
+`well_formed_task_*` constraints that need those columns in the row.
+
+### What the constraints cost
+
+Read paths pay nothing: `promise.get`, `task.get` and the 409 guard path are
+within noise of the unconstrained schema, because a CHECK runs on row
+modification and those modify nothing. Write paths pay. Bisected on lifecycle
+(five interleaved repeats, ±4-18%):
+
+| variant | p50 | WAL | what it adds |
+|---|---|---|---|
+| merged, bare | 634µs | 1.70MB | — |
+| + 31 plain CHECKs | 798µs | 1.70MB | +26%, no extra writes |
+| + 4 function CHECKs | 849µs | 1.70MB | +8% |
+| + the outbox foreign key | 869µs | **1.98MB** | +11% latency, **+16% WAL** |
+
+Two things are worth knowing before deciding.
+
+**The expression shape mattered more than the claims.** The first cut of
+`constraints.sql` cost +75% on lifecycle. Three uniqueness CHECKs called a SQL
+function whose body is a subquery — not inlinable, so it ran on every row
+modification — and two re-ran a jsonb key lookup that a STORED generated column
+already held. Guarding the calls behind a cardinality test and reading `target`
+and `is_timer` instead took it to +18% without dropping a single property.
+
+**The foreign key is the one structural cost.** It is the only constraint that
+adds an index, and `promises_task_key_unique` takes a new entry on every
+non-HOT update of a promise — hence the WAL, not just the CPU. It buys exactly
+one catalogue entry, `consistent_outbox_execute_names_existing_task`. If the
+constraint budget has to come down, drop that one first: it is 11% of the
+latency and all of the extra WAL, for 1 of 38 properties.
+
 ## Testing
 
 ```bash
