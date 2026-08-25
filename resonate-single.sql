@@ -16,9 +16,22 @@ CREATE SCHEMA IF NOT EXISTS resonate;
 SET search_path TO resonate, public;
 
 CREATE OR REPLACE FUNCTION resonate.get_schema_version() RETURNS text
-  LANGUAGE sql IMMUTABLE AS $$ SELECT '0.1.0'::text $$;
+  LANGUAGE sql IMMUTABLE AS $$ SELECT '0.2.0-single'::text $$;
 
--- --- promises ---------------------------------------------------------------
+-- --- promises (promise ⊕ task ⊕ obligations, one row) -----------------------
+-- The two-table design kept a promise and its task in separate rows joined on
+-- a shared id, with callbacks, listeners and resumes in three more tables. The
+-- abstract machine does not: `PromiseObject` carries `callbacks` and
+-- `listeners`, `TaskObject` carries `resumes`, and a task is exactly the
+-- targeted promises. This table is that state, verbatim.
+--
+-- Task columns are NULL when the promise carries no `resonate:target` tag —
+-- `task_state IS NULL` is "no task", and consistent_task_iff_targeted_promise
+-- pins it to the tag.
+--
+-- `tasks.timeout_at` is split into `retry_at` and `expires_at`. The machine has
+-- both (`TaskObject.retryAt`, `TaskObject.expiresAt`) and four catalogue
+-- entries quantify over them separately; one column cannot state them.
 CREATE TABLE IF NOT EXISTS promises (
   id            TEXT PRIMARY KEY,
   state         TEXT NOT NULL DEFAULT 'pending'
@@ -41,44 +54,29 @@ CREATE TABLE IF NOT EXISTS promises (
                   OR COALESCE(tags->>'resonate:external','') = 'true') STORED,
   timeout_at    BIGINT NOT NULL,
   created_at    BIGINT NOT NULL,
-  settled_at    BIGINT
+  settled_at    BIGINT,
+
+  -- task (NULL ⟺ the promise carries no resonate:target)
+  task_state    TEXT
+                  CHECK (task_state IN ('pending','acquired','suspended','halted','fulfilled')),
+  task_version  INT,
+  ttl           BIGINT,
+  pid           TEXT,
+  expires_at    BIGINT,
+  retry_at      BIGINT,
+  resumes       TEXT[] NOT NULL DEFAULT '{}',
+
+  -- obligations
+  awaiters      TEXT[] NOT NULL DEFAULT '{}',
+  listeners     TEXT[] NOT NULL DEFAULT '{}'
 );
+
 CREATE INDEX IF NOT EXISTS idx_promises_timeout_at ON promises (timeout_at) WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS idx_promises_origin_id ON promises (origin_id) WHERE origin_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_promises_branch_id ON promises (branch_id) WHERE branch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_promises_settled_at ON promises (settled_at) WHERE state <> 'pending';
-
--- --- tasks ------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS tasks (
-  id         TEXT PRIMARY KEY REFERENCES promises(id) ON DELETE CASCADE,
-  state      TEXT NOT NULL DEFAULT 'pending'
-               CHECK (state IN ('pending','acquired','suspended','halted','fulfilled')),
-  version    INT  NOT NULL DEFAULT 0,
-  ttl        BIGINT,
-  pid        TEXT,
-  timeout_at BIGINT
-);
-CREATE INDEX IF NOT EXISTS idx_tasks_timeout_at ON tasks (timeout_at) WHERE state IN ('pending','acquired');
-
-CREATE TABLE IF NOT EXISTS task_resumes (
-  task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  awaited_id TEXT NOT NULL,
-  PRIMARY KEY (task_id, awaited_id)
-);
-
--- --- registrations ----------------------------------------------------------
-CREATE TABLE IF NOT EXISTS callbacks (
-  awaited_id TEXT NOT NULL REFERENCES promises(id) ON DELETE CASCADE,
-  awaiter_id TEXT NOT NULL,
-  PRIMARY KEY (awaited_id, awaiter_id)
-);
-CREATE INDEX IF NOT EXISTS idx_callbacks_awaiter_id ON callbacks (awaiter_id);
-
-CREATE TABLE IF NOT EXISTS listeners (
-  awaited_id TEXT NOT NULL REFERENCES promises(id) ON DELETE CASCADE,
-  address    TEXT NOT NULL,
-  PRIMARY KEY (awaited_id, address)
-);
+CREATE INDEX IF NOT EXISTS idx_promises_retry_at ON promises (retry_at) WHERE task_state = 'pending';
+CREATE INDEX IF NOT EXISTS idx_promises_expires_at ON promises (expires_at) WHERE task_state = 'acquired';
 
 -- --- schedules --------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schedules (
@@ -172,6 +170,38 @@ CREATE OR REPLACE TRIGGER trg_outbox_notify
 
 SET search_path TO resonate, public;
 
+-- --- catalogue helpers (IMMUTABLE: usable from CHECK constraints) -----------
+CREATE OR REPLACE FUNCTION _arr_uniq(a text[]) RETURNS boolean
+  LANGUAGE sql IMMUTABLE AS $$
+  SELECT cardinality(a) = (SELECT count(DISTINCT x) FROM unnest(a) AS x);
+$$;
+
+-- ServerModel.addressValid
+CREATE OR REPLACE FUNCTION _addr_valid(a text) RETURNS boolean
+  LANGUAGE sql IMMUTABLE AS $$
+  SELECT a LIKE 'http://%' OR a LIKE 'https://%'
+      OR (a LIKE 'poll://%' AND position('@' IN a) > 0);
+$$;
+
+CREATE OR REPLACE FUNCTION _addrs_valid(a text[]) RETURNS boolean
+  LANGUAGE sql IMMUTABLE AS $$
+  SELECT COALESCE(bool_and(_addr_valid(x)), true) FROM unnest(a) AS x;
+$$;
+
+-- ServerModel.parseNat: total decimal fold, `acc*10 + (c - '0')` in Nat
+-- (truncated subtraction, so a char below '0' contributes 0). numeric, because
+-- a long garbage tag overflows bigint and the machine does not.
+CREATE OR REPLACE FUNCTION _parse_nat(s text) RETURNS numeric
+  LANGUAGE sql IMMUTABLE AS $$
+  SELECT COALESCE(
+    (SELECT sum(GREATEST(ascii(c) - 48, 0)::numeric
+                * power(10::numeric, length(s) - i))
+     FROM generate_subscripts(string_to_array(s, NULL), 1) AS i,
+          LATERAL (SELECT (string_to_array(s, NULL))[i] AS c) AS z),
+    0);
+$$;
+
+
 CREATE OR REPLACE FUNCTION _retry_timeout() RETURNS bigint
   LANGUAGE sql IMMUTABLE AS $$ SELECT 5000::bigint $$;
 
@@ -206,13 +236,13 @@ CREATE OR REPLACE FUNCTION _promise_timed(p promises) RETURNS boolean
   SELECT p.state = 'pending' AND p.external;
 $$;
 
-CREATE OR REPLACE FUNCTION _task_json(t tasks) RETURNS jsonb
-  LANGUAGE sql STABLE AS $$
+CREATE OR REPLACE FUNCTION _task_json(t promises) RETURNS jsonb
+  LANGUAGE sql IMMUTABLE AS $$
   SELECT jsonb_build_object(
     'id',      t.id,
-    'state',   t.state,
-    'version', t.version,
-    'resumes', (SELECT count(*) FROM task_resumes r WHERE r.task_id = t.id),
+    'state',   t.task_state,
+    'version', t.task_version,
+    'resumes', cardinality(t.resumes),
     'ttl',     t.ttl,
     'pid',     t.pid);
 $$;
@@ -244,25 +274,37 @@ $$;
 
 CREATE OR REPLACE FUNCTION _enqueue_resume(p_awaited text, p_awaiter text, now bigint)
   RETURNS void LANGUAGE plpgsql AS $$
-DECLARE t tasks; tgt text;
+DECLARE t promises;
 BEGIN
-  SELECT * INTO t FROM tasks WHERE id = p_awaiter FOR UPDATE;
-  IF NOT FOUND THEN RETURN; END IF;
+  SELECT * INTO t FROM promises WHERE id = p_awaiter FOR UPDATE;
+  IF NOT FOUND OR t.task_state IS NULL THEN RETURN; END IF;
 
-  IF t.state = 'suspended' THEN
-    UPDATE tasks SET state = 'pending',
-                     timeout_at = now + _retry_timeout() WHERE id = t.id;
-    DELETE FROM task_resumes WHERE task_id = t.id;
-    INSERT INTO task_resumes (task_id, awaited_id) VALUES (t.id, p_awaited)
-      ON CONFLICT DO NOTHING;
-    SELECT target INTO tgt FROM promises WHERE id = p_awaiter;
-    IF tgt IS NOT NULL AND tgt <> '' THEN
-      PERFORM _emit_execute(tgt, t.id, t.version);
+  IF t.task_state = 'suspended' THEN
+    UPDATE promises SET task_state = 'pending', retry_at = now + _retry_timeout(),
+                        resumes = ARRAY[p_awaited]
+     WHERE id = t.id;
+    IF t.target IS NOT NULL AND t.target <> '' THEN
+      PERFORM _emit_execute(t.target, t.id, t.task_version);
     END IF;
-  ELSIF t.state IN ('pending', 'acquired', 'halted') THEN
-    INSERT INTO task_resumes (task_id, awaited_id) VALUES (t.id, p_awaited)
-      ON CONFLICT DO NOTHING;
+  ELSIF t.task_state IN ('pending', 'acquired', 'halted') THEN
+    IF NOT (p_awaited = ANY (t.resumes)) THEN
+      UPDATE promises SET resumes = t.resumes || p_awaited WHERE id = t.id;
+    END IF;
   END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION _settle_row(p_id text, p_state text, vh jsonb, vd text,
+                                       p_at bigint) RETURNS promises
+  LANGUAGE plpgsql AS $$
+DECLARE r promises;
+BEGIN
+  UPDATE promises
+     SET state = p_state, value_headers = vh, value_data = vd, settled_at = p_at,
+         task_state = CASE WHEN task_state IS NULL THEN NULL ELSE 'fulfilled' END,
+         pid = NULL, ttl = NULL, expires_at = NULL, retry_at = NULL,
+         resumes = '{}', awaiters = '{}', listeners = '{}'
+   WHERE id = p_id RETURNING * INTO r;
+  RETURN r;
 END $$;
 
 -- --- settlement cascade ------------------------------------------------------
@@ -270,31 +312,27 @@ CREATE OR REPLACE FUNCTION _cascade_settle(p promises, now bigint) RETURNS void
   LANGUAGE plpgsql AS $$
 DECLARE awaiter text;
 BEGIN
-  UPDATE tasks SET state = 'fulfilled', pid = NULL, ttl = NULL WHERE id = p.id;
-  DELETE FROM task_resumes WHERE task_id = p.id;
+  -- `p` carries the SETTLED promise fields and the PRE-settle obligation
+  -- arrays; `_settle_row` has already cleared the stored row. Settling a
+  -- promise and fulfilling its task is one UPDATE, not two — with both in one
+  -- row, a second statement would leave a settled promise beside an acquired
+  -- task, which consistent_settled_promise_has_fulfilled_task forbids and a
+  -- CHECK (unlike a foreign key) cannot be deferred past.
   DELETE FROM outbox WHERE task_id = p.id;
 
   INSERT INTO outbox (key, kind, address, task_id, version, promise)
-  SELECT p.id || ':notify:' || l.address, 'unblock', l.address, NULL, NULL,
-         _promise_json(p, now)
-  FROM listeners l WHERE l.awaited_id = p.id
-  ORDER BY l.awaited_id, l.address
+  SELECT p.id || ':notify:' || a, 'unblock', a, NULL, NULL, _promise_json(p, now)
+  FROM unnest(p.listeners) AS a
+  ORDER BY a
   ON CONFLICT (key) DO UPDATE
     SET kind = 'unblock', address = EXCLUDED.address,
         task_id = NULL, version = NULL, promise = EXCLUDED.promise;
 
-  DELETE FROM callbacks
-    WHERE awaiter_id = p.id
-      AND awaited_id IN (SELECT id FROM promises WHERE state = 'pending');
-
-  PERFORM _lock(awaiter_id) FROM callbacks
-    WHERE awaited_id = p.id ORDER BY awaited_id, awaiter_id;
-  FOR awaiter IN SELECT awaiter_id FROM callbacks WHERE awaited_id = p.id ORDER BY awaited_id, awaiter_id LOOP
+  PERFORM _lock(a) FROM unnest(p.awaiters) AS a ORDER BY a;
+  FOREACH awaiter IN ARRAY (SELECT COALESCE(array_agg(a ORDER BY a), '{}')
+                            FROM unnest(p.awaiters) AS a) LOOP
     PERFORM _enqueue_resume(p.id, awaiter, now);
   END LOOP;
-
-  DELETE FROM callbacks WHERE awaited_id = p.id;
-  DELETE FROM listeners WHERE awaited_id = p.id;
 END $$;
 
 -- --- cron --------------------------------------------------------------------
@@ -394,7 +432,7 @@ CREATE OR REPLACE FUNCTION promise_create(
     p_id text, p_timeout_at bigint, p_param jsonb, p_tags jsonb, p_now bigint)
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
-  p promises; tgt text; delay bigint; st text;
+  p promises; tgt text; delay bigint; st text; dispatch boolean := false;
   ph jsonb := COALESCE(p_param->'headers', '{}'::jsonb);
   pd text  := p_param->>'data';
   tags jsonb := COALESCE(p_tags, '{}'::jsonb);
@@ -412,32 +450,40 @@ BEGIN
     RETURN jsonb_build_object('status', 200, 'promise', _promise_json(p, p_now));
   END IF;
 
-  IF p_timeout_at > p_now THEN
-    INSERT INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at)
-    VALUES (p_id, 'pending', ph, pd, tags, p_timeout_at, p_now)
-    RETURNING * INTO p;
+  tgt := tags->>'resonate:target';
 
-    tgt := tags->>'resonate:target';
+  IF p_timeout_at > p_now THEN
+    -- The task's first retry instant has to be settled before the INSERT now
+    -- that the task shares the promise's row; the dispatch still happens after.
     IF tgt IS NOT NULL THEN
       IF tags ? 'resonate:delay' AND (tags->>'resonate:delay')::bigint > p_now THEN
         delay := (tags->>'resonate:delay')::bigint;
       ELSE
         delay := p_now + _retry_timeout();
-        PERFORM _emit_execute(tgt, p.id, 0);
+        dispatch := true;
       END IF;
-      INSERT INTO tasks (id, state, version, timeout_at) VALUES (p.id, 'pending', 0, delay);
     END IF;
+
+    INSERT INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at,
+                          task_state, task_version, retry_at)
+    VALUES (p_id, 'pending', ph, pd, tags, p_timeout_at, p_now,
+            CASE WHEN tgt IS NOT NULL THEN 'pending' END,
+            CASE WHEN tgt IS NOT NULL THEN 0 END,
+            delay)
+    RETURNING * INTO p;
+
+    IF dispatch THEN PERFORM _emit_execute(tgt, p.id, 0); END IF;
     RETURN jsonb_build_object('status', 200, 'promise', _promise_json(p, p_now));
   ELSE
     st := CASE WHEN COALESCE(tags->>'resonate:timer','') = 'true'
                THEN 'resolved' ELSE 'rejected_timedout' END;
     INSERT INTO promises (id, state, param_headers, param_data, tags,
-                          timeout_at, created_at, settled_at)
-    VALUES (p_id, st, ph, pd, tags, p_timeout_at, p_timeout_at, p_timeout_at)
+                          timeout_at, created_at, settled_at,
+                          task_state, task_version)
+    VALUES (p_id, st, ph, pd, tags, p_timeout_at, p_timeout_at, p_timeout_at,
+            CASE WHEN tgt IS NOT NULL THEN 'fulfilled' END,
+            CASE WHEN tgt IS NOT NULL THEN 0 END)
     RETURNING * INTO p;
-    IF tags ? 'resonate:target' THEN
-      INSERT INTO tasks (id, state, version) VALUES (p.id, 'fulfilled', 0);
-    END IF;
     RETURN jsonb_build_object('status', 200, 'promise', _promise_json(p, p_now));
   END IF;
 EXCEPTION WHEN unique_violation THEN
@@ -449,7 +495,7 @@ CREATE OR REPLACE FUNCTION promise_settle(
     p_id text, p_state text, p_value jsonb, p_now bigint)
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
-  p promises;
+  p promises; obligations promises;
   vh jsonb := COALESCE(p_value->'headers', '{}'::jsonb);
   vd text  := p_value->>'data';
 BEGIN
@@ -465,10 +511,9 @@ BEGIN
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
 
   IF p.state = 'pending' AND p.timeout_at > p_now THEN
-    UPDATE promises
-       SET state = p_state, value_headers = vh, value_data = vd, settled_at = p_now
-     WHERE id = p.id
-     RETURNING * INTO p;
+    obligations := p;
+    p := _settle_row(p.id, p_state, vh, vd, p_now);
+    p.awaiters := obligations.awaiters; p.listeners := obligations.listeners;
     PERFORM _cascade_settle(p, p_now);
   END IF;
   RETURN jsonb_build_object('status', 200, 'promise', _promise_json(p, p_now));
@@ -496,8 +541,9 @@ BEGIN
   IF pa.state = 'pending' THEN
     IF pa.timeout_at > p_now THEN
       IF pw.state = 'pending' AND pw.timeout_at > p_now THEN
-        INSERT INTO callbacks (awaited_id, awaiter_id) VALUES (p_awaited, p_awaiter)
-          ON CONFLICT DO NOTHING;
+        IF NOT (p_awaiter = ANY (pa.awaiters)) THEN
+          UPDATE promises SET awaiters = pa.awaiters || p_awaiter WHERE id = p_awaited;
+        END IF;
       END IF;
     END IF;
   END IF;
@@ -509,9 +555,7 @@ CREATE OR REPLACE FUNCTION promise_register_listener(
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE pa promises;
 BEGIN
-  IF p_address IS NULL
-     OR NOT (p_address LIKE 'http://%' OR p_address LIKE 'https://%'
-             OR (p_address LIKE 'poll://%' AND position('@' IN p_address) > 0)) THEN
+  IF p_address IS NULL OR NOT _addr_valid(p_address) THEN
     RETURN jsonb_build_object('status', 400);
   END IF;
   PERFORM _lock(p_awaited);
@@ -523,8 +567,9 @@ BEGIN
   IF NOT pa.external THEN RETURN jsonb_build_object('status', 422); END IF;
 
   IF pa.state = 'pending' AND pa.timeout_at > p_now THEN
-    INSERT INTO listeners (awaited_id, address) VALUES (p_awaited, p_address)
-      ON CONFLICT DO NOTHING;
+    IF NOT (p_address = ANY (pa.listeners)) THEN
+      UPDATE promises SET listeners = pa.listeners || p_address WHERE id = p_awaited;
+    END IF;
   END IF;
   RETURN jsonb_build_object('status', 200, 'promise', _promise_json(pa, p_now));
 END $$;
@@ -540,28 +585,27 @@ SET search_path TO resonate, public;
 
 CREATE OR REPLACE FUNCTION task_get(p_id text, p_now bigint) RETURNS jsonb
   LANGUAGE plpgsql AS $$
-DECLARE t tasks; p promises;
+DECLARE t promises;
 BEGIN
-  SELECT * INTO t FROM tasks WHERE id = p_id;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
-  SELECT * INTO p FROM promises WHERE id = t.id;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
+  SELECT * INTO t FROM promises WHERE id = p_id;
+  IF NOT FOUND OR t.task_state IS NULL THEN RETURN jsonb_build_object('status', 404); END IF;
 
-  IF p.state = 'pending' AND p.timeout_at > p_now THEN
+  IF t.state = 'pending' AND t.timeout_at > p_now THEN
     RETURN jsonb_build_object('status', 200, 'task', _task_json(t));
   END IF;
   RETURN jsonb_build_object('status', 200, 'task', jsonb_build_object(
-    'id', t.id, 'state', 'fulfilled', 'version', t.version,
+    'id', t.id, 'state', 'fulfilled', 'version', t.task_version,
     'resumes', 0, 'ttl', NULL, 'pid', NULL));
 END $$;
 
 DROP FUNCTION IF EXISTS task_create_typed(text, bigint, text, bigint, jsonb, text, jsonb, bigint);
+DROP FUNCTION IF EXISTS _task_json(tasks);
 
 CREATE OR REPLACE FUNCTION task_create(
     p_pid text, p_ttl bigint, p_action jsonb, p_now bigint)
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
-  p promises; t tasks; st text;
+  p promises; st text;
   a_id      text   := p_action->>'id';
   a_toat    bigint := (p_action->>'timeoutAt')::bigint;
   a_headers jsonb  := COALESCE(p_action#>'{param,headers}', '{}'::jsonb);
@@ -579,79 +623,76 @@ BEGIN
   SELECT * INTO p FROM promises WHERE id = a_id FOR UPDATE;
   IF NOT FOUND THEN
     IF a_toat > p_now THEN
-      INSERT INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at)
-      VALUES (a_id, 'pending', a_headers, a_data, a_tags, a_toat, p_now) RETURNING * INTO p;
-      INSERT INTO tasks (id, state, version, ttl, pid, timeout_at)
-      VALUES (p.id, 'acquired', 1, p_ttl, p_pid, p_now + p_ttl) RETURNING * INTO t;
+      INSERT INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at,
+                            task_state, task_version, ttl, pid, expires_at)
+      VALUES (a_id, 'pending', a_headers, a_data, a_tags, a_toat, p_now,
+              'acquired', 1, p_ttl, p_pid, p_now + p_ttl) RETURNING * INTO p;
     ELSE
       st := CASE WHEN COALESCE(a_tags->>'resonate:timer','') = 'true'
                  THEN 'resolved' ELSE 'rejected_timedout' END;
-      INSERT INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at, settled_at)
-      VALUES (a_id, st, a_headers, a_data, a_tags, a_toat, a_toat, a_toat) RETURNING * INTO p;
-      INSERT INTO tasks (id, state, version) VALUES (p.id, 'fulfilled', 0) RETURNING * INTO t;
+      INSERT INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at,
+                            settled_at, task_state, task_version)
+      VALUES (a_id, st, a_headers, a_data, a_tags, a_toat, a_toat, a_toat,
+              'fulfilled', 0) RETURNING * INTO p;
     END IF;
   ELSE
     -- The id names a plain promise (no resonate:target): not a malformed
     -- request but an unprocessable target — 422, matching the spec (T-02).
     IF NOT (p.tags ? 'resonate:target') THEN RETURN jsonb_build_object('status', 422); END IF;
-    SELECT * INTO t FROM tasks WHERE id = p.id FOR UPDATE;
-    IF NOT FOUND THEN RETURN jsonb_build_object('status', 409); END IF;
-    IF t.state = 'fulfilled' THEN
+    IF p.task_state IS NULL THEN RETURN jsonb_build_object('status', 409); END IF;
+    IF p.task_state = 'fulfilled' THEN
       NULL;
-    ELSIF t.state = 'pending' THEN
-      DELETE FROM task_resumes WHERE task_id = t.id;
-      UPDATE tasks SET state = 'acquired', version = version + 1, ttl = p_ttl, pid = p_pid,
-                       timeout_at = p_now + p_ttl WHERE id = t.id RETURNING * INTO t;
+    ELSIF p.task_state = 'pending' THEN
+      UPDATE promises SET task_state = 'acquired', task_version = task_version + 1,
+                          ttl = p_ttl, pid = p_pid, expires_at = p_now + p_ttl,
+                          retry_at = NULL, resumes = '{}'
+       WHERE id = p.id RETURNING * INTO p;
     ELSE
       RETURN jsonb_build_object('status', 409);
     END IF;
   END IF;
-  RETURN jsonb_build_object('status', 200, 'task', _task_json(t),
+  RETURN jsonb_build_object('status', 200, 'task', _task_json(p),
                             'promise', _promise_json_raw(p));
 END $$;
 
 CREATE OR REPLACE FUNCTION task_acquire(
     p_id text, p_version int, p_pid text, p_ttl bigint, p_now bigint)
   RETURNS jsonb LANGUAGE plpgsql AS $$
-DECLARE t tasks; p promises;
+DECLARE t promises;
 BEGIN
   IF p_pid IS NULL OR p_ttl IS NULL THEN RETURN jsonb_build_object('status', 400); END IF;
   PERFORM _lock(p_id);
-  SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
-  SELECT * INTO p FROM promises WHERE id = t.id;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 409); END IF;
+  SELECT * INTO t FROM promises WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND OR t.task_state IS NULL THEN RETURN jsonb_build_object('status', 404); END IF;
 
-  IF t.state <> 'pending' THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.task_state <> 'pending' THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.state <> 'pending' OR t.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.task_version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
 
-  DELETE FROM task_resumes WHERE task_id = t.id;
-  UPDATE tasks SET state = 'acquired', version = version + 1, ttl = p_ttl, pid = p_pid,
-                   timeout_at = p_now + p_ttl
+  UPDATE promises SET task_state = 'acquired', task_version = task_version + 1,
+                      ttl = p_ttl, pid = p_pid, expires_at = p_now + p_ttl,
+                      retry_at = NULL, resumes = '{}'
     WHERE id = t.id RETURNING * INTO t;
   RETURN jsonb_build_object('status', 200, 'task', _task_json(t),
-                            'promise', _promise_json(p, p_now));
+                            'promise', _promise_json(t, p_now));
 END $$;
 
 CREATE OR REPLACE FUNCTION task_fence(
     p_id text, p_version int, p_action jsonb, p_now bigint)
   RETURNS jsonb LANGUAGE plpgsql AS $$
-DECLARE t tasks; p promises; r jsonb; kind text := p_action->>'kind'; req jsonb := p_action->'req';
+DECLARE t promises; r jsonb; kind text := p_action->>'kind'; req jsonb := p_action->'req';
 BEGIN
   -- A fence aimed at its own promise makes no sense: settling yourself is
   -- task.fulfill's job, and allowing it would fulfill the fencing task as a
   -- side effect of its own action. Rejected before any state is consulted.
   IF req->>'id' = p_id THEN RETURN jsonb_build_object('status', 400); END IF;
   PERFORM _lock(p_id);
-  SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
-  SELECT * INTO p FROM promises WHERE id = t.id;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 409); END IF;
+  SELECT * INTO t FROM promises WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND OR t.task_state IS NULL THEN RETURN jsonb_build_object('status', 404); END IF;
 
-  IF t.state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.task_state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.state <> 'pending' OR t.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.task_version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
 
   IF kind = 'create' THEN
     r := promise_create(req->>'id', (req->>'timeoutAt')::bigint,
@@ -673,12 +714,11 @@ BEGIN
     FROM jsonb_array_elements(COALESCE(p_tasks, '[]'::jsonb)) ref
   ) s ORDER BY lid;
 
-  UPDATE tasks t SET timeout_at = p_now + COALESCE(t.ttl, 0)
+  UPDATE promises t SET expires_at = p_now + COALESCE(t.ttl, 0)
   FROM (SELECT ref->>'id' AS id, (ref->>'version')::int AS version
         FROM jsonb_array_elements(COALESCE(p_tasks, '[]'::jsonb)) ref) r
-  JOIN promises p ON p.id = r.id
-  WHERE t.id = r.id AND t.state = 'acquired' AND t.version = r.version AND t.pid = p_pid
-    AND p.state = 'pending' AND p.timeout_at > p_now;
+  WHERE t.id = r.id AND t.task_state = 'acquired' AND t.task_version = r.version
+    AND t.pid = p_pid AND t.state = 'pending' AND t.timeout_at > p_now;
 
   RETURN jsonb_build_object('status', 200);
 END $$;
@@ -686,7 +726,7 @@ END $$;
 CREATE OR REPLACE FUNCTION task_suspend(
     p_id text, p_version int, p_actions jsonb, p_now bigint)
   RETURNS jsonb LANGUAGE plpgsql AS $$
-DECLARE t tasks; tp promises; missing int; internal bool; settled bool;
+DECLARE t promises; missing int; internal bool; settled bool;
 BEGIN
   -- Malformed requests are rejected with highest precedence — before
   -- existence, state, or version are consulted (spec T-06 guard order):
@@ -713,14 +753,12 @@ BEGIN
     SELECT act->>'awaited'
       FROM jsonb_array_elements(COALESCE(p_actions, '[]'::jsonb)) AS act
   ) s ORDER BY lid;
-  SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
-  SELECT * INTO tp FROM promises WHERE id = t.id;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 409); END IF;
+  SELECT * INTO t FROM promises WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND OR t.task_state IS NULL THEN RETURN jsonb_build_object('status', 404); END IF;
 
-  IF t.state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF tp.state <> 'pending' OR tp.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.task_state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.state <> 'pending' OR t.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.task_version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
 
   SELECT count(*) FILTER (WHERE pa.id IS NULL),
          COALESCE(bool_or(NOT pa.external), false),
@@ -734,16 +772,18 @@ BEGIN
   -- the suspended task could be stranded forever) → 422.
   IF internal THEN RETURN jsonb_build_object('status', 422); END IF;
   IF settled THEN
-    DELETE FROM task_resumes WHERE task_id = t.id;
+    UPDATE promises SET resumes = '{}' WHERE id = t.id;
     RETURN jsonb_build_object('status', 300);
   END IF;
 
-  INSERT INTO callbacks (awaited_id, awaiter_id)
-  SELECT act->>'awaited', t.id
-  FROM jsonb_array_elements(COALESCE(p_actions, '[]'::jsonb)) act
-  ON CONFLICT DO NOTHING;
-  DELETE FROM task_resumes WHERE task_id = t.id;
-  UPDATE tasks SET state = 'suspended', pid = NULL, ttl = NULL WHERE id = t.id;
+  UPDATE promises q
+     SET awaiters = CASE WHEN t.id = ANY (q.awaiters) THEN q.awaiters ELSE q.awaiters || t.id END
+    FROM jsonb_array_elements(COALESCE(p_actions, '[]'::jsonb)) act
+   WHERE q.id = act->>'awaited';
+
+  UPDATE promises SET task_state = 'suspended', pid = NULL, ttl = NULL,
+                      expires_at = NULL, retry_at = NULL, resumes = '{}'
+   WHERE id = t.id;
   RETURN jsonb_build_object('status', 200);
 END $$;
 
@@ -753,7 +793,7 @@ CREATE OR REPLACE FUNCTION task_fulfill(
     p_id text, p_version int, p_action jsonb, p_now bigint)
   RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
-  t tasks; p promises;
+  p promises; obligations promises;
   a_state   text  := p_action->>'state';
   a_headers jsonb := COALESCE(p_action#>'{value,headers}', '{}'::jsonb);
   a_data    text  := p_action#>>'{value,data}';
@@ -764,69 +804,66 @@ BEGIN
     RETURN jsonb_build_object('status', 400);
   END IF;
   PERFORM _lock(p_id);
-  SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
-  SELECT * INTO p FROM promises WHERE id = t.id FOR UPDATE;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
+  SELECT * INTO p FROM promises WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND OR p.task_state IS NULL THEN RETURN jsonb_build_object('status', 404); END IF;
+  IF p.task_state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
   IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
-  UPDATE promises SET state = a_state, value_headers = a_headers, value_data = a_data,
-                      settled_at = p_now WHERE id = p.id RETURNING * INTO p;
+  IF p.task_version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  obligations := p;
+  p := _settle_row(p.id, a_state, a_headers, a_data, p_now);
+  p.awaiters := obligations.awaiters; p.listeners := obligations.listeners;
   PERFORM _cascade_settle(p, p_now);
   RETURN jsonb_build_object('status', 200, 'promise', _promise_json_raw(p));
 END $$;
 
 CREATE OR REPLACE FUNCTION task_release(p_id text, p_version int, p_now bigint) RETURNS jsonb
   LANGUAGE plpgsql AS $$
-DECLARE t tasks; p promises;
+DECLARE t promises;
 BEGIN
   PERFORM _lock(p_id);
-  SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
-  SELECT * INTO p FROM promises WHERE id = t.id;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 409); END IF;
+  SELECT * INTO t FROM promises WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND OR t.task_state IS NULL THEN RETURN jsonb_build_object('status', 404); END IF;
 
-  IF t.state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF p.state <> 'pending' OR p.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.task_state <> 'acquired' THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.state <> 'pending' OR t.timeout_at <= p_now THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.task_version IS DISTINCT FROM p_version THEN RETURN jsonb_build_object('status', 409); END IF;
 
-  UPDATE tasks SET state = 'pending', pid = NULL, ttl = NULL,
-                   timeout_at = p_now + _retry_timeout() WHERE id = t.id;
-  IF p.target IS NOT NULL AND p.target <> '' THEN
-    PERFORM _emit_execute(p.target, t.id, t.version);
+  UPDATE promises SET task_state = 'pending', pid = NULL, ttl = NULL, expires_at = NULL,
+                      retry_at = p_now + _retry_timeout() WHERE id = t.id;
+  IF t.target IS NOT NULL AND t.target <> '' THEN
+    PERFORM _emit_execute(t.target, t.id, t.task_version);
   END IF;
   RETURN jsonb_build_object('status', 200);
 END $$;
 
 CREATE OR REPLACE FUNCTION task_halt(p_id text, p_now bigint) RETURNS jsonb
   LANGUAGE plpgsql AS $$
-DECLARE t tasks;
+DECLARE t promises;
 BEGIN
   PERFORM _lock(p_id);
-  SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
-  IF t.state = 'fulfilled' THEN RETURN jsonb_build_object('status', 409); END IF;
-  IF t.state = 'halted' THEN RETURN jsonb_build_object('status', 200); END IF;
+  SELECT * INTO t FROM promises WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND OR t.task_state IS NULL THEN RETURN jsonb_build_object('status', 404); END IF;
+  IF t.task_state = 'fulfilled' THEN RETURN jsonb_build_object('status', 409); END IF;
+  IF t.task_state = 'halted' THEN RETURN jsonb_build_object('status', 200); END IF;
 
-  UPDATE tasks SET state = 'halted', pid = NULL, ttl = NULL WHERE id = t.id;
+  UPDATE promises SET task_state = 'halted', pid = NULL, ttl = NULL,
+                      expires_at = NULL, retry_at = NULL WHERE id = t.id;
   RETURN jsonb_build_object('status', 200);
 END $$;
 
 CREATE OR REPLACE FUNCTION task_continue(p_id text, p_now bigint) RETURNS jsonb
   LANGUAGE plpgsql AS $$
-DECLARE t tasks; p promises;
+DECLARE t promises;
 BEGIN
   PERFORM _lock(p_id);
-  SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
-  IF t.state <> 'halted' THEN RETURN jsonb_build_object('status', 409); END IF;
-  SELECT * INTO p FROM promises WHERE id = t.id;
-  IF NOT FOUND THEN RETURN jsonb_build_object('status', 404); END IF;
+  SELECT * INTO t FROM promises WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND OR t.task_state IS NULL THEN RETURN jsonb_build_object('status', 404); END IF;
+  IF t.task_state <> 'halted' THEN RETURN jsonb_build_object('status', 409); END IF;
 
-  UPDATE tasks SET state = 'pending', timeout_at = p_now + _retry_timeout() WHERE id = t.id;
-  IF p.target IS NOT NULL AND p.target <> '' THEN
-    PERFORM _emit_execute(p.target, t.id, t.version);
+  UPDATE promises SET task_state = 'pending', retry_at = p_now + _retry_timeout()
+   WHERE id = t.id;
+  IF t.target IS NOT NULL AND t.target <> '' THEN
+    PERFORM _emit_execute(t.target, t.id, t.task_version);
   END IF;
   RETURN jsonb_build_object('status', 200);
 END $$;
@@ -908,7 +945,7 @@ SET search_path TO resonate, public;
 
 CREATE OR REPLACE FUNCTION _on_promise_timeout(p_id text, p_now bigint) RETURNS void
   LANGUAGE plpgsql AS $$
-DECLARE p promises; st text;
+DECLARE p promises; obligations promises; st text;
 BEGIN
   PERFORM _lock(p_id);
   SELECT * INTO p FROM promises WHERE id = p_id FOR UPDATE;
@@ -916,42 +953,38 @@ BEGIN
   IF p.state <> 'pending' THEN RETURN; END IF;
 
   st := CASE WHEN p.is_timer THEN 'resolved' ELSE 'rejected_timedout' END;
-  UPDATE promises SET state = st, settled_at = p.timeout_at WHERE id = p.id RETURNING * INTO p;
+  obligations := p;
+  p := _settle_row(p.id, st, p.value_headers, p.value_data, p.timeout_at);
+  p.awaiters := obligations.awaiters; p.listeners := obligations.listeners;
   PERFORM _cascade_settle(p, p_now);
 END $$;
 
 CREATE OR REPLACE FUNCTION _on_task_retry_timeout(p_id text, p_now bigint) RETURNS void
   LANGUAGE plpgsql AS $$
-DECLARE t tasks; p promises;
+DECLARE t promises;
 BEGIN
   PERFORM _lock(p_id);
-  SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN; END IF;
-  IF t.state <> 'pending' THEN RETURN; END IF;
+  SELECT * INTO t FROM promises WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND OR t.task_state IS DISTINCT FROM 'pending' THEN RETURN; END IF;
 
-  UPDATE tasks SET timeout_at = p_now + _retry_timeout() WHERE id = t.id;
-  SELECT * INTO p FROM promises WHERE id = t.id;
-  IF NOT FOUND THEN RETURN; END IF;
-  IF p.target IS NOT NULL AND p.target <> '' THEN
-    PERFORM _emit_execute(p.target, t.id, t.version);
+  UPDATE promises SET retry_at = p_now + _retry_timeout() WHERE id = t.id;
+  IF t.target IS NOT NULL AND t.target <> '' THEN
+    PERFORM _emit_execute(t.target, t.id, t.task_version);
   END IF;
 END $$;
 
 CREATE OR REPLACE FUNCTION _on_task_lease_timeout(p_id text, p_now bigint) RETURNS void
   LANGUAGE plpgsql AS $$
-DECLARE t tasks; p promises;
+DECLARE t promises;
 BEGIN
   PERFORM _lock(p_id);
-  SELECT * INTO t FROM tasks WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN; END IF;
-  IF t.state <> 'acquired' THEN RETURN; END IF;
+  SELECT * INTO t FROM promises WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND OR t.task_state IS DISTINCT FROM 'acquired' THEN RETURN; END IF;
 
-  UPDATE tasks SET state = 'pending', pid = NULL, ttl = NULL,
-                   timeout_at = p_now + _retry_timeout() WHERE id = t.id;
-  SELECT * INTO p FROM promises WHERE id = t.id;
-  IF NOT FOUND THEN RETURN; END IF;
-  IF p.target IS NOT NULL AND p.target <> '' THEN
-    PERFORM _emit_execute(p.target, t.id, t.version);
+  UPDATE promises SET task_state = 'pending', pid = NULL, ttl = NULL, expires_at = NULL,
+                      retry_at = p_now + _retry_timeout() WHERE id = t.id;
+  IF t.target IS NOT NULL AND t.target <> '' THEN
+    PERFORM _emit_execute(t.target, t.id, t.task_version);
   END IF;
 END $$;
 
@@ -993,11 +1026,12 @@ CREATE OR REPLACE FUNCTION process_task_timeouts(p_now bigint) RETURNS int
   LANGUAGE plpgsql AS $$
 DECLARE r record; cnt int := 0;
 BEGIN
-  FOR r IN SELECT id, state FROM tasks
-           WHERE state IN ('pending','acquired') AND timeout_at <= p_now
-           ORDER BY timeout_at, id LOOP
-    IF r.state = 'pending' THEN PERFORM _on_task_retry_timeout(r.id, p_now);
-    ELSE                        PERFORM _on_task_lease_timeout(r.id, p_now); END IF;
+  FOR r IN SELECT id, task_state FROM promises
+           WHERE (task_state = 'pending'  AND retry_at   <= p_now)
+              OR (task_state = 'acquired' AND expires_at <= p_now)
+           ORDER BY COALESCE(retry_at, expires_at), id LOOP
+    IF r.task_state = 'pending' THEN PERFORM _on_task_retry_timeout(r.id, p_now);
+    ELSE                             PERFORM _on_task_lease_timeout(r.id, p_now); END IF;
     cnt := cnt + 1;
   END LOOP;
   RETURN cnt;
@@ -1301,9 +1335,6 @@ CREATE OR REPLACE FUNCTION gc(p_settled_before bigint, p_limit int DEFAULT 10000
   unb AS (
     DELETE FROM outbox
     WHERE kind = 'unblock' AND promise->>'id' IN (SELECT id FROM del)
-    RETURNING 1),
-  tr AS (
-    DELETE FROM task_resumes WHERE awaited_id IN (SELECT id FROM del)
     RETURNING 1)
   SELECT count(*) FROM del;
 $$;
