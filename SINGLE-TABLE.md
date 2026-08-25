@@ -239,7 +239,24 @@ modification and those modify nothing. Write paths pay. Bisected on lifecycle
 | + 4 function CHECKs | 849µs | 1.70MB | +8% |
 | + the outbox foreign key | 869µs | **1.98MB** | +11% latency, **+16% WAL** |
 
-Two things are worth knowing before deciding.
+Bisected again on `listeners`, which puts six addresses on every promise:
+
+| variant | p50 | what it adds |
+|---|---|---|
+| merged, bare | 538µs | — |
+| + 31 plain CHECKs | 721µs | +34% |
+| + the outbox foreign key | 764µs | +6% |
+| + 4 function CHECKs | 923µs | **+28%** |
+
+The function CHECKs cost 8% on lifecycle and 28% here, and the difference is
+the point: the cardinality guard in front of `_arr_uniq` and `_addrs_valid`
+makes them free for an array of fewer than two elements, which is the ordinary
+case, and does nothing once a promise really does carry six listeners. That
+cost scales with obligation fan-in, so it is bounded by the same thing that
+bounds the array length — read it as "uniqueness costs where there is
+something to compare", not as a flat tax.
+
+Three things are worth knowing before deciding.
 
 **The expression shape mattered more than the claims.** The first cut of
 `constraints.sql` cost +75% on lifecycle. Three uniqueness CHECKs called a SQL
