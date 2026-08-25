@@ -39,18 +39,25 @@ def main(path):
             d = per[v]
             lat, dl = d["latency"]["all"], d["delta"]
             base = per[BASE]
+            med = d.get("spread", {}).get("p50_med", lat["p50"])
+            bmed = base.get("spread", {}).get("p50_med", base["latency"]["all"]["p50"])
+            sp = d.get("spread")
+            noise = (f"±{(sp['p50_max']-sp['p50_min'])/sp['p50_med']*100:.0f}%"
+                     if sp and sp["p50_med"] else "")
             rows.append([
                 v,
-                f"{lat['p50']:.0f}",
+                f"{med:.0f}",
+                noise,
                 f"{lat['p99']:.0f}",
-                rel(lat["p50"], base["latency"]["all"]["p50"]),
+                rel(med, bmed),
                 f"{dl['wal']/1e6:.2f}",
                 rel(dl["wal"], base["delta"]["wal"]),
                 f"{dl['tup']['ins']+dl['tup']['upd']+dl['tup']['del']}",
                 f"{dl['buf']['hit']}",
             ])
         table(f"{wl}  (n={per[variants[0]]['ops']} requests)", rows,
-              ["p50", "p99", "Δp50", "WAL MB", "ΔWAL", "rows written", "buf hits"])
+              ["p50", "noise", "p99", "Δp50", "WAL MB", "ΔWAL",
+               "rows written", "buf hits"])
 
     print()
     print("=" * 78)

@@ -32,6 +32,9 @@ ALL_VARIANTS = {
     "c_plain": (_dsn("res_c_plain"), "one"),    # no fn-call CHECKs, no task_key FK
     "c_nofn":  (_dsn("res_c_nofn"), "one"),     # no fn-call CHECKs
     "c_nofk":  (_dsn("res_c_nofk"), "one"),     # no task_key FK
+    # merged + constraints, with param/value pushed out of line: an UPDATE that
+    # does not touch them then copies a TOAST pointer, not the bytes
+    "one_toast": (_dsn("res_one_toast"), "one"),
 }
 VARIANTS = {k: ALL_VARIANTS[k] for k in ("two", "one_nc", "one")}
 
@@ -291,24 +294,38 @@ def main():
     names = list(WORKLOADS) if args.workload == "all" else [args.workload]
     report = {}
     for w in names:
+        # Repeats are INTERLEAVED across variants, not grouped by variant. Run
+        # all of one variant's repeats together and any drift over the run —
+        # cache warmth, another process, the clock — lands entirely on whichever
+        # variant held that slot, which is indistinguishable from a real
+        # difference. Round-robin spreads it across all of them.
+        reps = {label: [] for label in VARIANTS}
+        for rep in range(args.repeat):
+            for label, (dsn, layout) in VARIANTS.items():
+                rows, b4, af, size, wall = run_one(dsn, layout, w, args.n,
+                                                   warm=(rep == 0))
+                reps[label].append({"latency": summarize(rows),
+                                    "delta": delta(b4, af), "size": size,
+                                    "wall_s": wall, "ops": len(rows)})
+
         report[w] = {}
-        for label, (dsn, layout) in VARIANTS.items():
-            best = None
-            for rep in range(args.repeat):
-                rows, b4, af, size, wall = run_one(dsn, layout, w, args.n, warm=(rep == 0))
-                s = summarize(rows)
-                cand = {"latency": s, "delta": delta(b4, af), "size": size,
-                        "wall_s": wall, "ops": len(rows)}
-                # keep the fastest repeat: least contaminated by background noise
-                if best is None or cand["latency"]["all"]["p50"] < best["latency"]["all"]["p50"]:
-                    best = cand
-            report[w][label] = best
-            print(f"{w:10s} {label:7s} n={best['ops']:6d}  "
-                  f"p50={best['latency']['all']['p50']:8.1f}µs  "
-                  f"p99={best['latency']['all']['p99']:9.1f}µs  "
-                  f"wal={best['delta']['wal']/1e6:8.2f}MB  "
-                  f"upd={best['delta']['tup']['upd']:7d}  "
-                  f"hot={best['delta']['tup']['hot']:7d}", file=sys.stderr)
+        for label, rs in reps.items():
+            # median across repeats, not min: the minimum is the luckiest
+            # sample, and reporting it hides how much of the gap is noise.
+            p50s = sorted(r["latency"]["all"]["p50"] for r in rs)
+            mid = rs[[r["latency"]["all"]["p50"] for r in rs].index(p50s[len(p50s) // 2])]
+            mid = dict(mid)
+            mid["spread"] = {"p50_min": p50s[0], "p50_med": p50s[len(p50s) // 2],
+                             "p50_max": p50s[-1], "repeats": len(rs)}
+            report[w][label] = mid
+            sp = mid["spread"]
+            noise = (sp["p50_max"] - sp["p50_min"]) / sp["p50_med"] * 100
+            print(f"{w:10s} {label:9s} n={mid['ops']:6d}  "
+                  f"p50={sp['p50_med']:8.1f}µs (±{noise:4.0f}%)  "
+                  f"p99={mid['latency']['all']['p99']:9.1f}µs  "
+                  f"wal={mid['delta']['wal']/1e6:8.2f}MB  "
+                  f"rows={mid['delta']['tup']['ins']+mid['delta']['tup']['upd']:7d}  "
+                  f"hot={mid['delta']['tup']['hot']:7d}", file=sys.stderr)
 
     js = json.dumps(report, indent=1)
     if args.out:
