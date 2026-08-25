@@ -205,9 +205,37 @@ carries a primary key per obligation table, and those disappear.
 | `promise.get` | −12% | |
 
 The fanout gain is the interesting one, because fan-out is the shape the
-obligation tables were there to serve. 11 503 of the merged updates in that
-workload are HOT against 774 for the split: an array append touches no indexed
-column, so it can stay on the page.
+obligation tables were there to serve: one parent awaiting eight children is
+eight callback registrations and then eight resume records. It is where the
+split should look best.
+
+What changes is not that the same writes got cheaper but that most of them stop
+being writes at all. Per-table counters, 200 parents x 8 children:
+
+| | split | merged |
+|---|---|---|
+| `promises` | 1800 ins, 1600 upd, 0 HOT | 1800 ins, 5200 upd, **2627 HOT** |
+| `tasks` | 1800 ins, 2200 upd, 0 HOT | — |
+| `callbacks` | 1600 ins | — |
+| `task_resumes` | 1600 ins | — |
+| total row-writes | 12 800 | **9 000** |
+
+The merged layout does *more* updates — an obligation that was an INSERT into a
+skinny table is now an UPDATE of the promise row — and far fewer inserts,
+because the task, callback and resume rows stop existing.
+
+Half of those updates are HOT. A normal update writes a new entry into **every**
+index on the table, not just the ones whose columns changed; a Heap-Only Tuple
+update writes none, provided no indexed column moved and the new version fits on
+the same page. `awaiters` and `resumes` appear in no index, so an append
+qualifies. The split cannot match this on the same work for a reason that has
+nothing to do with its indexes: it records obligations with INSERTs, and an
+insert is never HOT.
+
+Page room is the other condition, and it is why the ratio is 50.5% rather than
+100%. `fillfactor = 70` on `promises` takes it to 57.7% and the index from 352K
+to 320K — a real knob, trading table size for index size, worth measuring on
+real data rather than adopting on principle.
 
 ### Where it loses, by request kind
 
