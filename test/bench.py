@@ -17,8 +17,23 @@ Usage:  python3 test/bench.py [--workload W] [--n N] [--repeat R]
 import argparse, json, random, statistics, sys, time
 import psycopg
 
-DSN_TWO = "host=/tmp port=5433 user=postgres dbname=res_two"
-DSN_ONE = "host=/tmp port=5433 user=postgres dbname=res_one"
+def _dsn(db):
+    return f"host=/tmp port=5433 user=postgres dbname={db}"
+
+
+# label -> (dsn, layout). `one_nc` is the merged schema with constraints.sql
+# NOT applied, so the three together separate the cost of merging from the
+# cost of enforcing the catalogue.
+ALL_VARIANTS = {
+    "two":     (_dsn("res_two"), "two"),        # baseline, five tables
+    "one_nc":  (_dsn("res_one_nc"), "one"),     # merged, no constraints
+    "one":     (_dsn("res_one"), "one"),        # merged, full constraints.sql
+    # bisect variants: which part of constraints.sql costs what
+    "c_plain": (_dsn("res_c_plain"), "one"),    # no fn-call CHECKs, no task_key FK
+    "c_nofn":  (_dsn("res_c_nofn"), "one"),     # no fn-call CHECKs
+    "c_nofk":  (_dsn("res_c_nofk"), "one"),     # no task_key FK
+}
+VARIANTS = {k: ALL_VARIANTS[k] for k in ("two", "one_nc", "one")}
 
 RESET = {
     "two": "TRUNCATE resonate.outbox, resonate.listeners, resonate.callbacks, "
@@ -267,13 +282,17 @@ def main():
     ap.add_argument("--n", type=int, default=2000)
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--variants", default="two,one_nc,one",
+                    help="comma-separated subset of " + ",".join(ALL_VARIANTS))
     args = ap.parse_args()
 
+    global VARIANTS
+    VARIANTS = {k: ALL_VARIANTS[k] for k in args.variants.split(",")}
     names = list(WORKLOADS) if args.workload == "all" else [args.workload]
     report = {}
     for w in names:
         report[w] = {}
-        for layout, dsn in (("two", DSN_TWO), ("one", DSN_ONE)):
+        for label, (dsn, layout) in VARIANTS.items():
             best = None
             for rep in range(args.repeat):
                 rows, b4, af, size, wall = run_one(dsn, layout, w, args.n, warm=(rep == 0))
@@ -283,8 +302,8 @@ def main():
                 # keep the fastest repeat: least contaminated by background noise
                 if best is None or cand["latency"]["all"]["p50"] < best["latency"]["all"]["p50"]:
                     best = cand
-            report[w][layout] = best
-            print(f"{w:10s} {layout}  n={best['ops']:6d}  "
+            report[w][label] = best
+            print(f"{w:10s} {label:7s} n={best['ops']:6d}  "
                   f"p50={best['latency']['all']['p50']:8.1f}µs  "
                   f"p99={best['latency']['all']['p99']:9.1f}µs  "
                   f"wal={best['delta']['wal']/1e6:8.2f}MB  "

@@ -161,7 +161,7 @@ RESET = {
 }
 
 
-def run(dsn_two, dsn_one, seed, programs, steps, verbose=False):
+def run(dsn_two, dsn_one, seed, programs, steps, verbose=False, gc_every=0):
     fails, gaps_hit = [], set()
     with psycopg.connect(dsn_two, autocommit=True) as a, \
          psycopg.connect(dsn_one, autocommit=True) as b:
@@ -185,6 +185,10 @@ def run(dsn_two, dsn_one, seed, programs, steps, verbose=False):
                     gen.now = now
                     tick(a, now)
                     tick(b, now)
+
+                if gc_every and i % gc_every == gc_every - 1:
+                    for c in (a, b):
+                        c.execute("SELECT resonate.gc(%s, 64)", (now,))
 
                 sa = model.normalize(model.snapshot(a, "two"))
                 sb = model.normalize(model.snapshot(b, "one"))
@@ -225,10 +229,13 @@ if __name__ == "__main__":
     ap.add_argument("--steps", type=int, default=120)
     ap.add_argument("--two", default="host=/tmp port=5433 user=postgres dbname=res_two")
     ap.add_argument("--one", default="host=/tmp port=5433 user=postgres dbname=res_one")
+    ap.add_argument("--gc-every", type=int, default=0,
+                    help="run gc() on both stores every N steps (0 = never)")
     ap.add_argument("-v", action="store_true")
     args = ap.parse_args()
 
-    f, gaps = run(args.two, args.one, args.seed, args.programs, args.steps, args.v)
+    f, gaps = run(args.two, args.one, args.seed, args.programs, args.steps,
+                  args.v, args.gc_every)
     if gaps:
         print(f"note: both stores reached {len(gaps)} of the spec's "
               f"{model.GAP_COUNT} known gaps identically: {', '.join(sorted(gaps))}")

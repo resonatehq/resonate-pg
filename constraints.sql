@@ -31,6 +31,12 @@
 --   * the three `gaps` entries — they change behaviour. See constraints-gaps.sql.
 -- =============================================================================
 
+-- A CHECK runs on every insert and every update of the row, so the SHAPE of the
+-- expression matters as much as the claim. Two rules throughout: read a STORED
+-- generated column (`target`, `is_timer`, `external`) rather than re-running the
+-- jsonb key lookup, and guard a function call behind the cheap test that makes
+-- it unnecessary in the ordinary case.
+
 SET search_path TO resonate, public;
 
 -- --- promises: well-formedness ----------------------------------------------
@@ -62,7 +68,7 @@ ALTER TABLE promises ADD CONSTRAINT well_formed_promise_deadline_settlement_has_
          OR (value_data IS NULL AND value_headers = '{}'::jsonb));
 
 ALTER TABLE promises ADD CONSTRAINT well_formed_promise_timer_not_targeted
-  CHECK (NOT (is_timer AND tags ? 'resonate:target'));
+  CHECK (NOT (is_timer AND target IS NOT NULL));
 
 ALTER TABLE promises ADD CONSTRAINT well_formed_promise_timedout_is_server_owned
   CHECK (state <> 'rejected_timedout' OR settled_at = timeout_at);
@@ -70,10 +76,10 @@ ALTER TABLE promises ADD CONSTRAINT well_formed_promise_timedout_is_server_owned
 -- The awaiter set was a table with a two-column primary key; as an array
 -- column its uniqueness is a predicate on the row.
 ALTER TABLE promises ADD CONSTRAINT well_formed_promise_callbacks_unique
-  CHECK (_arr_uniq(awaiters));
+  CHECK (cardinality(awaiters) < 2 OR _arr_uniq(awaiters));
 
 ALTER TABLE promises ADD CONSTRAINT well_formed_promise_listeners_unique
-  CHECK (_arr_uniq(listeners));
+  CHECK (cardinality(listeners) < 2 OR _arr_uniq(listeners));
 
 ALTER TABLE promises ADD CONSTRAINT well_formed_promise_obligations_require_external
   CHECK (external OR (awaiters = '{}' AND listeners = '{}'));
@@ -116,7 +122,7 @@ ALTER TABLE promises ADD CONSTRAINT well_formed_task_suspended_has_no_resumes
   CHECK (task_state IS DISTINCT FROM 'suspended' OR resumes = '{}');
 
 ALTER TABLE promises ADD CONSTRAINT well_formed_task_resumes_unique
-  CHECK (_arr_uniq(resumes));
+  CHECK (cardinality(resumes) < 2 OR _arr_uniq(resumes));
 
 ALTER TABLE promises ADD CONSTRAINT well_formed_task_acquired_version_positive
   CHECK (task_state IS DISTINCT FROM 'acquired' OR task_version >= 1);
@@ -126,7 +132,7 @@ ALTER TABLE promises ADD CONSTRAINT well_formed_task_acquired_version_positive
 -- A task exists exactly for the targeted promises — a biconditional across two
 -- tables, and a single NULL test in one.
 ALTER TABLE promises ADD CONSTRAINT consistent_task_iff_targeted_promise
-  CHECK ((task_state IS NOT NULL) = (tags ? 'resonate:target'));
+  CHECK ((task_state IS NOT NULL) = (target IS NOT NULL));
 
 -- A settled promise's task is fulfilled.
 ALTER TABLE promises ADD CONSTRAINT consistent_settled_promise_has_fulfilled_task
@@ -139,7 +145,7 @@ ALTER TABLE promises ADD CONSTRAINT consistent_settled_task_promise_settled
 -- --- obligations ------------------------------------------------------------
 
 ALTER TABLE promises ADD CONSTRAINT consistent_listener_addresses_deliverable
-  CHECK (_addrs_valid(listeners));
+  CHECK (listeners = '{}' OR _addrs_valid(listeners));
 
 -- --- outbox → task ----------------------------------------------------------
 -- `consistent_outbox_execute_names_existing_task` is a foreign key on the
