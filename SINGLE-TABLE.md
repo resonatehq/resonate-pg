@@ -70,7 +70,7 @@ across rows; only fan-in lengthens an array, and that is the rare shape.
 `origin_id` is derived from the id, not from the `resonate:origin` tag:
 
 ```sql
-origin_id TEXT NOT NULL GENERATED ALWAYS AS (split_part(id, ':', 1)) STORED
+origin_id TEXT GENERATED ALWAYS AS (split_part(id, ':', 1)) STORED
 ```
 
 The convention is `foo.1` for a top-level promise, which is its own origin, and
@@ -87,9 +87,11 @@ rather than as the 500 a CHECK violation would surface as.
 
 Two consequences worth stating.
 
-**The origin index stops being partial.** `WHERE origin_id IS NOT NULL`
-excluded nothing once the column became `NOT NULL`; keeping it would only have
-misled. A predicate that does exclude the roots — `origin_id <> id` — is not
+**The origin index stops being partial.** `split_part` of a non-null primary
+key is never null, so `WHERE origin_id IS NOT NULL` now matches every row and
+keeping it would only have misled. (The column carries no `NOT NULL` of its
+own: it would be redundant with the expression, and stating it invites the
+reader to think it is load-bearing.) A predicate that does exclude the roots — `origin_id <> id` — is not
 usable, because the planner cannot prove it from an `origin_id = $1 AND
 id <> $1` lookup and the index would go unread. So it indexes every row, and
 the cost lands exactly on the workloads that set no origin tag today:
@@ -104,6 +106,14 @@ the cost lands exactly on the workloads that set no origin tag today:
 Where the tag was already being set the index is unchanged; where it was not,
 it doubles from a near-empty base. That is the honest trade for an origin that
 cannot be wrong.
+
+**A schedule may not carry an origin tag.** A schedule expands a new promise
+id on every firing, so a fixed `resonate:origin` could agree with at most one
+of them and every later firing would be refused at `promise_create`'s door —
+the schedule would silently produce nothing, one firing at a time.
+`schedule_create` refuses the tag up front with a 400 instead. Schedules
+created before this check may still carry one; they need clearing at the same
+time as the id rewrite below.
 
 **It is only correct under the colon convention.** An id from an older
 convention — `foo.1.2` for a child, say — computes its own id as its origin,
