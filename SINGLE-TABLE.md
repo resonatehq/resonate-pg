@@ -65,6 +65,52 @@ ordinary case, it costs nothing to keep it honest.
 different `awaited_id`s — each child's array holds one element. Fan-out spreads
 across rows; only fan-in lengthens an array, and that is the rare shape.
 
+## The id carries the origin
+
+`origin_id` is derived from the id, not from the `resonate:origin` tag:
+
+```sql
+origin_id TEXT NOT NULL GENERATED ALWAYS AS (split_part(id, ':', 1)) STORED
+```
+
+The convention is `foo.1` for a top-level promise, which is its own origin, and
+`foo.1:1` for a child of it — at most one colon, everything before it the
+origin. One expression covers both shapes, because `split_part` on a
+colon-free id returns the whole id.
+
+This is strictly better than checking the tag against the id. A constraint can
+only reject a disagreement that a client already sent; a derived column makes
+the disagreement unrepresentable. The tag is then redundant, and where a
+request still carries one, `promise_create` and `task_create` reject a
+mismatch with a **400** — at the door, where a malformed request belongs,
+rather than as the 500 a CHECK violation would surface as.
+
+Two consequences worth stating.
+
+**The origin index stops being partial.** `WHERE origin_id IS NOT NULL`
+excluded nothing once the column became `NOT NULL`; keeping it would only have
+misled. A predicate that does exclude the roots — `origin_id <> id` — is not
+usable, because the planner cannot prove it from an `origin_id = $1 AND
+id <> $1` lookup and the index would go unread. So it indexes every row, and
+the cost lands exactly on the workloads that set no origin tag today:
+
+| workload | tag-derived, partial | id-derived, full |
+|---|---|---|
+| fanout (tags everything) | 32K | 32K |
+| lifecycle (tags everything) | 16K | 16K |
+| listeners (tags nothing) | 8K | 16K |
+| heartbeat (tags nothing) | 8K | 16K |
+
+Where the tag was already being set the index is unchanged; where it was not,
+it doubles from a near-empty base. That is the honest trade for an origin that
+cannot be wrong.
+
+**It is only correct under the colon convention.** An id from an older
+convention — `foo.1.2` for a child, say — computes its own id as its origin,
+silently, and `gc` and `_preload` both read `origin_id`. Any store holding
+pre-convention ids needs them rewritten before this column is introduced, not
+after.
+
 ## The one behavioural divergence
 
 `_cascade_settle` in the two-table layout eagerly deletes the settling

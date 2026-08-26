@@ -30,7 +30,11 @@ CREATE TABLE IF NOT EXISTS promises (
   value_data    TEXT,
   tags          JSONB NOT NULL DEFAULT '{}',
   target        TEXT GENERATED ALWAYS AS (tags->>'resonate:target') STORED,
-  origin_id     TEXT GENERATED ALWAYS AS (tags->>'resonate:origin') STORED,
+  -- The id carries the origin: `foo.1` is a top-level promise and its own
+  -- origin, `foo.1:1` is a child of it. Deriving the column from the id
+  -- rather than from the `resonate:origin` tag makes the two incapable of
+  -- disagreeing; the tag is checked against it at the door instead.
+  origin_id     TEXT NOT NULL GENERATED ALWAYS AS (split_part(id, ':', 1)) STORED,
   parent_id     TEXT GENERATED ALWAYS AS (tags->>'resonate:parent') STORED,
   branch_id     TEXT GENERATED ALWAYS AS (tags->>'resonate:branch') STORED,
   is_timer      BOOLEAN NOT NULL
@@ -44,7 +48,12 @@ CREATE TABLE IF NOT EXISTS promises (
   settled_at    BIGINT
 );
 CREATE INDEX IF NOT EXISTS idx_promises_timeout_at ON promises (timeout_at) WHERE state = 'pending';
-CREATE INDEX IF NOT EXISTS idx_promises_origin_id ON promises (origin_id) WHERE origin_id IS NOT NULL;
+-- No longer partial: `origin_id` is derived from the id and is NOT NULL for
+-- every row, so the old `WHERE origin_id IS NOT NULL` predicate excluded
+-- nothing and only misled. A predicate that does exclude the roots
+-- (`origin_id <> id`) is not usable here — the planner cannot prove it from
+-- an `origin_id = $1 AND id <> $1` lookup, so the index would go unused.
+CREATE INDEX IF NOT EXISTS idx_promises_origin_id ON promises (origin_id);
 CREATE INDEX IF NOT EXISTS idx_promises_branch_id ON promises (branch_id) WHERE branch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_promises_settled_at ON promises (settled_at) WHERE state <> 'pending';
 
@@ -406,6 +415,12 @@ BEGIN
   IF COALESCE(tags->>'resonate:timer','') = 'true' AND tags ? 'resonate:target' THEN
     RETURN jsonb_build_object('status', 400);
   END IF;
+  -- The origin is derived from the id, so a `resonate:origin` tag that names
+  -- anything else is a malformed request rather than a stored disagreement.
+  IF tags ? 'resonate:origin'
+     AND tags->>'resonate:origin' IS DISTINCT FROM split_part(p_id, ':', 1) THEN
+    RETURN jsonb_build_object('status', 400);
+  END IF;
   PERFORM _lock(p_id);
   SELECT * INTO p FROM promises WHERE id = p_id FOR UPDATE;
   IF FOUND THEN
@@ -573,6 +588,10 @@ BEGIN
   END IF;
   IF NOT (a_tags ? 'resonate:target') THEN RETURN jsonb_build_object('status', 400); END IF;
   IF COALESCE(a_tags->>'resonate:timer','') = 'true' THEN
+    RETURN jsonb_build_object('status', 400);
+  END IF;
+  IF a_tags ? 'resonate:origin'
+     AND a_tags->>'resonate:origin' IS DISTINCT FROM split_part(a_id, ':', 1) THEN
     RETURN jsonb_build_object('status', 400);
   END IF;
   PERFORM _lock(a_id);

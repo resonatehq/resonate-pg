@@ -63,11 +63,12 @@ class Gen:
         if r.random() < 0.2:
             t["resonate:external"] = "true"
         if r.random() < 0.3:
-            if self.id_format == "resonate":
-                # filled in by step() once the id this belongs to is known
-                t["resonate:origin"] = None
-            else:
-                t["resonate:origin"] = r.choice(self.ids) if self.ids else "p0"
+            # `resonate:origin` must now agree with the id's prefix or the door
+            # returns 400; None is the placeholder step() resolves once it knows
+            # which id this belongs to. One in eight is left deliberately wrong,
+            # to keep the reject path covered.
+            t["resonate:origin"] = (r.choice(self.ids) if self.ids and r.random() < 0.125
+                                    else None)
         if r.random() < 0.15:
             t["resonate:delay"] = str(self.now + r.choice([-5000, 5000, 10 ** 15]))
         return t
@@ -78,8 +79,7 @@ class Gen:
 
     def step(self):
         kind, data = self._step()
-        if self.id_format == "resonate":
-            _resolve_origin(data, self._origin_for)
+        _resolve_origin(data, self._origin_for)
         return kind, data
 
     def _step(self):

@@ -40,17 +40,11 @@ SET search_path TO resonate, public;
 ALTER TABLE promises ADD CONSTRAINT well_formed_promise_id_at_most_one_separator
   CHECK (id ~ '^[^:]*(:[^:]*)?$');
 
--- The one worth having. Shape alone catches typos; this catches a promise
--- filed under the wrong origin, which is the failure that actually costs
--- something: `_preload` selects a resuming worker's replay set by `origin_id`,
--- and the streaming examples multiplex a Realtime channel on it. A mismatch
--- puts a promise in another workflow's replay set.
---
--- One expression covers both id shapes: for a top-level id with no colon,
--- `split_part` returns the whole id, so the claim reads "a promise with no
--- separator is its own origin".
-ALTER TABLE promises ADD CONSTRAINT consistent_promise_id_matches_origin
-  CHECK (origin_id IS NULL OR origin_id = split_part(id, ':', 1));
+-- The agreement between the id and the `resonate:origin` tag is NOT here: the
+-- column is derived from the id (`split_part(id, ':', 1)`), so the two cannot
+-- disagree in storage, and a tag naming anything else is rejected at the door
+-- by `promise_create` and `task_create` with a 400. A constraint would only be
+-- able to say the same thing later and worse, as a 500.
 
 -- The strictest of the three, and it is OFF because the randomised run refutes
 -- it against the stock server: `promise.create {"id": "foo.6:6", "tags": {}}`
