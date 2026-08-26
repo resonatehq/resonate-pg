@@ -23,8 +23,9 @@ SETTLE_STATES = ["resolved", "rejected", "rejected_canceled",
 class Gen:
     """Random request stream over a small, deliberately colliding id space."""
 
-    def __init__(self, rnd):
+    def __init__(self, rnd, id_format="free"):
         self.rnd = rnd
+        self.id_format = id_format
         self.now = 1_000_000
         self.ids = []
         self.sched = []
@@ -35,11 +36,20 @@ class Gen:
         if self.ids and r.random() < 0.75:
             return r.choice(self.ids)
         self.n += 1
-        # a dotted id space so `_preload`-style ancestry and origin tags mean
-        # something, and so ids collide across requests
-        pid = f"p{self.n % 17}" + ("." + str(self.n % 5) if r.random() < 0.4 else "")
+        if self.id_format == "resonate":
+            # `foo.N` is a root and its own origin; `foo.N:M` is a child of it.
+            root = f"foo.{self.n % 11}"
+            pid = root if r.random() < 0.35 else f"{root}:{self.n % 7}"
+        else:
+            # a dotted id space so `_preload`-style ancestry and origin tags mean
+            # something, and so ids collide across requests
+            pid = f"p{self.n % 17}" + ("." + str(self.n % 5) if r.random() < 0.4 else "")
         self.ids.append(pid)
         return pid
+
+    def _origin_for(self, pid):
+        """The origin tag the id convention implies, so the two never disagree."""
+        return pid.split(":", 1)[0]
 
     def _tags(self):
         r = self.rnd
@@ -53,7 +63,11 @@ class Gen:
         if r.random() < 0.2:
             t["resonate:external"] = "true"
         if r.random() < 0.3:
-            t["resonate:origin"] = r.choice(self.ids) if self.ids else "p0"
+            if self.id_format == "resonate":
+                # filled in by step() once the id this belongs to is known
+                t["resonate:origin"] = None
+            else:
+                t["resonate:origin"] = r.choice(self.ids) if self.ids else "p0"
         if r.random() < 0.15:
             t["resonate:delay"] = str(self.now + r.choice([-5000, 5000, 10 ** 15]))
         return t
@@ -63,6 +77,12 @@ class Gen:
         return self.now + r.choice([-10_000, -1, 0, 1, 5_000, 60_000, 10 ** 9])
 
     def step(self):
+        kind, data = self._step()
+        if self.id_format == "resonate":
+            _resolve_origin(data, self._origin_for)
+        return kind, data
+
+    def _step(self):
         r = self.rnd
         self.now += r.choice([0, 1, 10, 250, 3_000, 7_000])
         k = r.random()
@@ -141,6 +161,22 @@ class Gen:
         return ("schedule.get", {"id": f"s{r.randint(1, 3)}"})
 
 
+def _resolve_origin(node, origin_of):
+    """Point every `resonate:origin: None` placeholder at its own id's origin."""
+    if isinstance(node, dict):
+        tags, pid = node.get("tags"), node.get("id")
+        if isinstance(tags, dict) and tags.get("resonate:origin", "") is None:
+            if isinstance(pid, str):
+                tags["resonate:origin"] = origin_of(pid)
+            else:
+                tags.pop("resonate:origin")
+        for v in node.values():
+            _resolve_origin(v, origin_of)
+    elif isinstance(node, list):
+        for v in node:
+            _resolve_origin(v, origin_of)
+
+
 def rpc(conn, kind, data, now, corr):
     req = {"kind": kind, "head": {"corrId": corr, "version": "1",
                                   "resonate:debug_time": str(now)},
@@ -161,14 +197,15 @@ RESET = {
 }
 
 
-def run(dsn_two, dsn_one, seed, programs, steps, verbose=False, gc_every=0):
+def run(dsn_two, dsn_one, seed, programs, steps, verbose=False, gc_every=0,
+        id_format="free"):
     fails, gaps_hit = [], set()
     with psycopg.connect(dsn_two, autocommit=True) as a, \
          psycopg.connect(dsn_one, autocommit=True) as b:
         for prog in range(programs):
             a.execute(RESET["two"])
             b.execute(RESET["one"])
-            gen = Gen(random.Random(seed * 100003 + prog))
+            gen = Gen(random.Random(seed * 100003 + prog), id_format)
             for i in range(steps):
                 kind, data = gen.step()
                 now = gen.now
@@ -229,13 +266,16 @@ if __name__ == "__main__":
     ap.add_argument("--steps", type=int, default=120)
     ap.add_argument("--two", default="host=/tmp port=5433 user=postgres dbname=res_two")
     ap.add_argument("--one", default="host=/tmp port=5433 user=postgres dbname=res_one")
+    ap.add_argument("--ids", default="free", choices=["free", "resonate"],
+                    help="'resonate' generates foo.N / foo.N:M ids with matching "
+                         "origin tags, as constraints-id.sql requires")
     ap.add_argument("--gc-every", type=int, default=0,
                     help="run gc() on both stores every N steps (0 = never)")
     ap.add_argument("-v", action="store_true")
     args = ap.parse_args()
 
     f, gaps = run(args.two, args.one, args.seed, args.programs, args.steps,
-                  args.v, args.gc_every)
+                  args.v, args.gc_every, args.ids)
     if gaps:
         print(f"note: both stores reached {len(gaps)} of the spec's "
               f"{model.GAP_COUNT} known gaps identically: {', '.join(sorted(gaps))}")
