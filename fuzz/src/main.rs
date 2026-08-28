@@ -436,7 +436,17 @@ fn plan(t: &mut Tape, l: &Live, now: i64) -> Option<(String, Value)> {
             // which made timer and target mutually exclusive — and a store with
             // the timerTargeted guard removed then survived a whole run, because
             // the witness was inexpressible.
-            let mut tags = json!({ "resonate:origin": id.split(':').next().unwrap() });
+            // One in eight names a DISAGREEING origin. Without this the origin
+            // door guard is unfindable: every generated tag agreed with the id
+            // by construction, so a store with that guard deleted survived the
+            // whole battery. Third time this class of blindness has appeared —
+            // a generator that cannot express the witness passes vacuously.
+            let origin = if t.byte() % 8 == 0 {
+                format!("zz.{}", t.upto(4))
+            } else {
+                id.split(':').next().unwrap().to_string()
+            };
+            let mut tags = json!({ "resonate:origin": origin });
             if t.byte() % 3 == 0 {
                 tags["resonate:timer"] = json!("true");
             }
@@ -511,7 +521,16 @@ fn plan(t: &mut Tape, l: &Live, now: i64) -> Option<(String, Value)> {
             let n = t.upto(4); // 0 is legal input and must be refused
             let mut actions = vec![];
             for _ in 0..n {
-                if let Some((a, _, _)) = pick_id(t, &l.pending_targeted()) {
+                // One in four draws from ALL promises, not just pending ones,
+                // so an already-settled awaited can appear. Suspending on a
+                // settled promise is what the 300 path exists for, and drawing
+                // only from `pending_targeted` made that path unreachable.
+                let pool = if t.byte() % 4 == 0 {
+                    l.rows.iter().collect::<Vec<_>>()
+                } else {
+                    l.pending_targeted()
+                };
+                if let Some((a, _, _)) = pick_id(t, &pool) {
                     actions.push(json!({ "data": { "awaited": a } }));
                 }
             }
