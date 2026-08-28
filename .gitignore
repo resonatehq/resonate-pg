@@ -5,3 +5,5 @@ supabase/
 .env.*
 __pycache__/
 *.pyc
+fuzz/target/
+fuzz/findings/

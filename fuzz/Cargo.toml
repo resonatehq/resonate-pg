@@ -1,0 +1,14 @@
+[package]
+name = "resonate-pg-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libafl = "0.16.1"
+libafl_bolts = "0.16.1"
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+serde_json = "1"
+
+[profile.release]
+debug = true
