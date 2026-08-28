@@ -1,49 +1,28 @@
 //! A coverage-guided differential fuzzer for resonate-pg, on LibAFL.
 //!
-//! The point of using LibAFL here is the separation the framework makes and a
-//! hand-rolled loop does not:
+//!   FEEDBACK  a custom bitmap whose entries are BEHAVIOURAL signatures rather
+//!             than code edges. No instrumentation: the harness writes the map.
+//!             What goes into a signature is selectable — see `Feedback` — so
+//!             the choice can be measured rather than asserted.
 //!
-//!   FEEDBACK  decides what earns a corpus slot — here, a custom bitmap whose
-//!             entries are BEHAVIOURAL signatures rather than code edges. No
-//!             instrumentation is involved: the harness writes the map itself.
+//!   OBJECTIVE divergence. The harness returns `ExitKind::Crash` when the two
+//!             schema layouts answer differently or either raises, and
+//!             `CrashFeedback` collects it. The merged store carries the
+//!             catalogue as CHECK constraints, so a violation raises and
+//!             `resonate_rpc`'s exception arm makes it a 500 — which turns a
+//!             catalogue violation into an objective on a SINGLE store, the
+//!             finding two agreeing implementations can never produce.
 //!
-//!   OBJECTIVE decides what counts as a finding. For a differential that is not
-//!             a crash, it is disagreement — so the harness returns
-//!             `ExitKind::Crash` when the two schema layouts answer differently,
-//!             or when either raises, and `CrashFeedback` collects it.
+//! The input is a decision TAPE, not a request: a planner consumes tape bytes
+//! while reading live state, so the tape chooses WHICH pending task to acquire
+//! and the database supplies its id and version. Mutation moves the plan, not
+//! the syntax.
 //!
-//! WHAT IS UNDER TEST
-//! ------------------
-//! Two databases carrying the same protocol under different schemas: the
-//! two-table `resonate.sql` and the merged `resonate-single.sql`. Every request
-//! goes to both at the same instant, and their answers must match.
-//!
-//! The merged store also carries `constraints.sql` — 38 entries of the
-//! specification's conformance catalogue, as CHECK/UNIQUE/FOREIGN KEY. That
-//! makes a second property oracle free: a catalogue violation raises inside
-//! `resonate_rpc`, whose exception arm turns it into a 500. So "the constrained
-//! store returned 500" IS "a catalogue property was violated", and it is an
-//! objective on a SINGLE store — the kind of finding cross-checking two
-//! implementations can never produce, because two stores that share a bug agree.
-//!
-//! THE INPUT IS A DECISION TAPE, NOT A REQUEST
-//! -------------------------------------------
-//! Mutating request bytes is hopeless here: `task.acquire` needs a task that
-//! exists, is pending, and is at exactly the right version, and blind mutation
-//! essentially never produces one — the Python generator in `test/` is the
-//! control experiment, sitting at 0.7% success on that call.
-//!
-//! So the input is a tape of decision bytes, and a planner consumes it while
-//! reading live state out of the database: the tape chooses WHICH pending task
-//! to acquire, the database supplies its id and version. Every request is
-//! well-formed by construction, mutating the tape mutates the plan, and the
-//! fuzzer climbs the signature space instead of the syntax space. Zest calls
-//! this generator-based fuzzing; it is the reason the corpus is worth having.
-//!
-//! Run:
-//!   createdb res_fuzz_two && psql -d res_fuzz_two -f resonate.sql
-//!   createdb res_fuzz_one && psql -d res_fuzz_one -f resonate-single.sql -f constraints-all.sql
-//!   cargo run --release
+//! Environment:
+//!   FUZZ_TWO / FUZZ_ONE   connection strings for the two stores
+//!   FUZZ_FEEDBACK         points | edges | preconds | shapes   (default: shapes)
+//!   FUZZ_MAX_EXECS        stop after N executions with no finding (0 = forever)
+//!   FUZZ_QUIET            suppress the per-finding report
 
 use std::{path::PathBuf, ptr::write};
 
@@ -66,10 +45,51 @@ use libafl_bolts::{current_nanos, nonzero, rands::StdRand, tuples::tuple_list};
 use postgres::{Client, NoTls};
 use serde_json::{json, Value};
 
+// ─── feedback configuration ──────────────────────────────────────────────────
+
+/// What a signature is made of. Each level adds one signal to the one before,
+/// so the battery can attribute a change in bug-finding to a single addition.
+#[derive(Clone, Copy, PartialEq)]
+enum Feedback {
+    /// (operation, status, aggregate shape of the store). Points, not edges.
+    Points,
+    /// Points, plus AFL's edge encoding: the signature of the PREVIOUS step is
+    /// mixed in, so a new ORDER of the same steps is novel. This is most of
+    /// why AFL's bitmap works and it was missing here.
+    Edges,
+    /// Edges, plus the preconditions that held on the operand this step names —
+    /// a proxy for which guard fired, since the guards are tests on exactly
+    /// these predicates. Distinguishes "409 because the version was wrong" from
+    /// "409 because the task was not pending", which a status code cannot.
+    Preconds,
+    /// Preconds, but the store's shape is measured PER OBJECT (0/1/2/many on the
+    /// largest awaiter set, the largest listener set) rather than as a sum over
+    /// all promises. A sum cannot tell one promise with five awaiters from five
+    /// promises with one each — fan-in from fan-out — which is the distinction
+    /// the merged layout's behaviour actually turns on.
+    Shapes,
+}
+
+impl Feedback {
+    fn from_env() -> Self {
+        match std::env::var("FUZZ_FEEDBACK").unwrap_or_default().as_str() {
+            "points" => Feedback::Points,
+            "edges" => Feedback::Edges,
+            "preconds" => Feedback::Preconds,
+            _ => Feedback::Shapes,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Feedback::Points => "points",
+            Feedback::Edges => "edges",
+            Feedback::Preconds => "preconds",
+            Feedback::Shapes => "shapes",
+        }
+    }
+}
+
 // ─── the bitmap ──────────────────────────────────────────────────────────────
-// 64KB, the classic AFL size, but every entry is a behavioural signature:
-// (operation, response status, bucketed shape of the store). Nothing here comes
-// from instrumentation — `signal` is called by the harness.
 
 const MAP_SIZE: usize = 65536;
 static mut SIGNALS: [u8; MAP_SIZE] = [0; MAP_SIZE];
@@ -92,10 +112,6 @@ fn clear_map() {
 }
 
 /// AFL's hit-count bucketing, applied to a cardinality.
-///
-/// Eight buckets rather than "is it non-empty": a store with three suspended
-/// tasks is a different shape from one with thirty, and a feedback that cannot
-/// tell them apart has nothing to climb.
 fn bucket(n: i64) -> u64 {
     match n {
         0 => 0,
@@ -109,8 +125,23 @@ fn bucket(n: i64) -> u64 {
     }
 }
 
+/// 0 / 1 / 2 / many — the boundaries the implementation itself branches on.
+/// `well_formed_promise_callbacks_unique` is literally
+/// `cardinality(awaiters) < 2 OR _arr_uniq(awaiters)`.
+fn small(n: i64) -> u64 {
+    match n {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 3,
+    }
+}
+
 fn mix(mut h: u64, v: u64) -> u64 {
-    h ^= v.wrapping_add(0x9e37_79b9_7f4a_7c15).wrapping_add(h << 6).wrapping_add(h >> 2);
+    h ^= v
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(h << 6)
+        .wrapping_add(h >> 2);
     h
 }
 
@@ -140,7 +171,6 @@ impl<'a> Tape<'a> {
             self.byte() as usize % n
         }
     }
-    /// Two bytes, for a value that wants more range than 0..255.
     fn word(&mut self) -> u32 {
         (self.byte() as u32) << 8 | self.byte() as u32
     }
@@ -170,150 +200,230 @@ const OPS: &[&str] = &[
     "tick",
 ];
 
-/// What the planner needs to know to build a request that will actually land.
-struct Live {
-    pending_tasks: Vec<(String, i32)>,
-    acquired_tasks: Vec<(String, i32, String)>,
-    suspended: Vec<String>,
-    halted: Vec<String>,
-    pending_promises: Vec<String>,
-    pending_targeted: Vec<String>,
-    schedules: Vec<String>,
-    all_promises: Vec<String>,
+/// One promise row, as the planner and the shape signals need it.
+#[derive(Clone)]
+struct Row {
+    id: String,
+    state: String,
+    task_state: Option<String>,
+    version: i32,
+    pid: Option<String>,
+    targeted: bool,
+    external: bool,
+    timeout_at: i64,
+    awaiters: i64,
+    listeners: i64,
+    resumes: i64,
 }
 
+struct Live {
+    rows: Vec<Row>,
+    outbox: i64,
+    schedule_ids: Vec<String>,
+}
+
+impl Live {
+    fn by_task(&self, st: &str) -> Vec<&Row> {
+        self.rows.iter().filter(|r| r.task_state.as_deref() == Some(st)).collect()
+    }
+    fn pending_promises(&self) -> Vec<&Row> {
+        self.rows.iter().filter(|r| r.state == "pending").collect()
+    }
+    fn pending_targeted(&self) -> Vec<&Row> {
+        self.rows.iter().filter(|r| r.state == "pending" && r.targeted).collect()
+    }
+    fn find(&self, id: &str) -> Option<&Row> {
+        self.rows.iter().find(|r| r.id == id)
+    }
+}
+
+/// One round trip, not two: the outbox count rides along as an uncorrelated
+/// scalar subquery, which the planner evaluates once.
 fn read_live(c: &mut Client) -> Result<Live, postgres::Error> {
-    let mut l = Live {
-        pending_tasks: vec![],
-        acquired_tasks: vec![],
-        suspended: vec![],
-        halted: vec![],
-        pending_promises: vec![],
-        pending_targeted: vec![],
-        schedules: vec![],
-        all_promises: vec![],
-    };
+    let mut rows = Vec::new();
+    let mut outbox = 0i64;
     for r in c.query(
-        "SELECT id, task_state, task_version, pid, state, target IS NOT NULL
-           FROM resonate.promises ORDER BY id LIMIT 200",
+        "SELECT id, state, task_state, COALESCE(task_version, 0), pid,
+                target IS NOT NULL, external, timeout_at,
+                cardinality(awaiters), cardinality(listeners), cardinality(resumes),
+                (SELECT count(*) FROM resonate.outbox)
+           FROM resonate.promises ORDER BY id LIMIT 300",
         &[],
     )? {
-        let id: String = r.get(0);
-        let ts: Option<String> = r.get(1);
-        let tv: Option<i32> = r.get(2);
-        let pid: Option<String> = r.get(3);
-        let ps: String = r.get(4);
-        let targeted: bool = r.get(5);
-        l.all_promises.push(id.clone());
-        if ps == "pending" {
-            l.pending_promises.push(id.clone());
-            if targeted {
-                l.pending_targeted.push(id.clone());
-            }
-        }
-        match ts.as_deref() {
-            Some("pending") => l.pending_tasks.push((id, tv.unwrap_or(0))),
-            Some("acquired") => {
-                l.acquired_tasks.push((id, tv.unwrap_or(0), pid.unwrap_or_default()))
-            }
-            Some("suspended") => l.suspended.push(id),
-            Some("halted") => l.halted.push(id),
-            _ => {}
-        }
+        rows.push(Row {
+            id: r.get(0),
+            state: r.get(1),
+            task_state: r.get(2),
+            version: r.get(3),
+            pid: r.get(4),
+            targeted: r.get(5),
+            external: r.get(6),
+            timeout_at: r.get(7),
+            awaiters: r.get::<_, Option<i32>>(8).unwrap_or(0) as i64,
+            listeners: r.get::<_, Option<i32>>(9).unwrap_or(0) as i64,
+            resumes: r.get::<_, Option<i32>>(10).unwrap_or(0) as i64,
+        });
+        outbox = r.get(11);
     }
+    let mut schedule_ids = Vec::new();
     for r in c.query("SELECT id FROM resonate.schedules ORDER BY id LIMIT 50", &[])? {
-        l.schedules.push(r.get(0));
+        schedule_ids.push(r.get(0));
     }
-    Ok(l)
+    Ok(Live { rows, outbox, schedule_ids })
 }
 
-fn shape(c: &mut Client) -> Result<u64, postgres::Error> {
-    let r = c.query_one(
-        "SELECT count(*) FILTER (WHERE state = 'pending'),
-                count(*) FILTER (WHERE state <> 'pending'),
-                count(*) FILTER (WHERE task_state = 'pending'),
-                count(*) FILTER (WHERE task_state = 'acquired'),
-                count(*) FILTER (WHERE task_state = 'suspended'),
-                count(*) FILTER (WHERE task_state = 'halted'),
-                COALESCE(sum(cardinality(awaiters)), 0),
-                COALESCE(sum(cardinality(listeners)), 0),
-                COALESCE(sum(cardinality(resumes)), 0),
-                (SELECT count(*) FROM resonate.outbox),
-                (SELECT count(*) FROM resonate.schedules)
-           FROM resonate.promises",
-        &[],
-    )?;
+/// Aggregate shape — sums, which cannot tell fan-in from fan-out.
+fn shape_aggregate(l: &Live) -> u64 {
+    let c = |f: &dyn Fn(&Row) -> bool| l.rows.iter().filter(|r| f(r)).count() as i64;
     let mut h = 0u64;
-    for i in 0..11 {
-        let v: i64 = r.get(i);
-        h = mix(h, bucket(v));
+    h = mix(h, bucket(c(&|r| r.state == "pending")));
+    h = mix(h, bucket(c(&|r| r.state != "pending")));
+    for st in ["pending", "acquired", "suspended", "halted", "fulfilled"] {
+        h = mix(h, bucket(c(&|r| r.task_state.as_deref() == Some(st))));
     }
-    Ok(h)
+    h = mix(h, bucket(l.rows.iter().map(|r| r.awaiters).sum()));
+    h = mix(h, bucket(l.rows.iter().map(|r| r.listeners).sum()));
+    h = mix(h, bucket(l.rows.iter().map(|r| r.resumes).sum()));
+    h = mix(h, bucket(l.outbox));
+    h = mix(h, bucket(l.schedule_ids.len() as i64));
+    h
+}
+
+/// Per-object shape — the largest set, and how many objects carry one, so a
+/// promise awaited by five is a different shape from five awaited by one.
+fn shape_per_object(l: &Live) -> u64 {
+    let mut h = shape_aggregate(l);
+    h = mix(h, small(l.rows.iter().map(|r| r.awaiters).max().unwrap_or(0)));
+    h = mix(h, small(l.rows.iter().map(|r| r.listeners).max().unwrap_or(0)));
+    h = mix(h, small(l.rows.iter().map(|r| r.resumes).max().unwrap_or(0)));
+    h = mix(h, small(l.rows.iter().filter(|r| r.awaiters > 0).count() as i64));
+    h = mix(h, small(l.rows.iter().filter(|r| r.listeners > 0).count() as i64));
+    h
+}
+
+/// The preconditions that held on this request's operand, before it ran.
+///
+/// A proxy for "which guard fired": the guards test exactly these predicates,
+/// so the vector separates the three distinct ways `task.acquire` reaches 409.
+/// Free — it reads the snapshot the planner already fetched.
+fn preconds(l: &Live, kind: &str, data: &Value, now: i64) -> u64 {
+    let id = data
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| data.pointer("/action/data/id").and_then(|v| v.as_str()))
+        .or_else(|| data.get("awaited").and_then(|v| v.as_str()));
+    let mut h = 0u64;
+    match id.and_then(|i| l.find(i)) {
+        None => h = mix(h, 1),
+        Some(r) => {
+            h = mix(h, 2);
+            h = mix(h, if r.state == "pending" { 1 } else { 0 });
+            h = mix(h, if r.timeout_at > now { 1 } else { 0 });
+            h = mix(h, if r.external { 1 } else { 0 });
+            h = mix(h, if r.targeted { 1 } else { 0 });
+            h = mix(
+                h,
+                match r.task_state.as_deref() {
+                    None => 0,
+                    Some("pending") => 1,
+                    Some("acquired") => 2,
+                    Some("suspended") => 3,
+                    Some("halted") => 4,
+                    _ => 5,
+                },
+            );
+            // does the request name the version the store actually holds?
+            let v = data.get("version").and_then(|v| v.as_i64());
+            h = mix(h, match v {
+                None => 0,
+                Some(v) if v == r.version as i64 => 1,
+                Some(_) => 2,
+            });
+            h = mix(h, small(r.awaiters));
+            h = mix(h, small(r.resumes));
+        }
+    }
+    // `task.suspend`'s malformed shapes are guards in their own right.
+    if kind == "task.suspend" {
+        let n = data.get("actions").and_then(|v| v.as_array()).map_or(0, |a| a.len());
+        h = mix(h, small(n as i64));
+    }
+    h
 }
 
 /// Which operations can actually land against this state.
-///
-/// Choosing the operation first and hunting for an operand afterwards is what
-/// keeps a blind generator at 0.7% on `task.acquire`: with no pending task it
-/// invents an id and collects a 404. Filtering first — the shape `pick_op` in
-/// the Rust differential uses — means the tape only ever chooses among things
-/// the store can currently do.
 fn eligible(l: &Live) -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = vec![
-        // always available: they create their own preconditions
-        "promise.create", "task.create", "schedule.create", "tick",
-    ];
-    if !l.all_promises.is_empty() {
+    let mut v: Vec<&'static str> =
+        vec!["promise.create", "task.create", "schedule.create", "tick"];
+    if !l.rows.is_empty() {
         v.push("promise.get");
         v.push("task.get");
     }
-    if !l.pending_promises.is_empty() {
+    if !l.pending_promises().is_empty() {
         v.push("promise.settle");
         v.push("promise.register_listener");
     }
-    if !l.pending_targeted.is_empty() {
+    if !l.pending_targeted().is_empty() {
         v.push("promise.register_callback");
     }
-    if !l.pending_tasks.is_empty() {
+    if !l.by_task("pending").is_empty() {
         v.push("task.acquire");
     }
-    if !l.acquired_tasks.is_empty() {
+    if !l.by_task("acquired").is_empty() {
         v.push("task.release");
         v.push("task.fulfill");
         v.push("task.fence");
         v.push("task.heartbeat");
-        if !l.pending_targeted.is_empty() {
+        if !l.pending_targeted().is_empty() {
             v.push("task.suspend");
         }
     }
-    if !l.halted.is_empty() {
+    if !l.by_task("halted").is_empty() {
         v.push("task.continue");
     }
-    if !l.pending_tasks.is_empty() || !l.acquired_tasks.is_empty() || !l.suspended.is_empty() {
+    if !l.by_task("pending").is_empty()
+        || !l.by_task("acquired").is_empty()
+        || !l.by_task("suspended").is_empty()
+    {
         v.push("task.halt");
     }
-    if !l.schedules.is_empty() {
+    if !l.schedule_ids.is_empty() {
         v.push("schedule.get");
         v.push("schedule.delete");
     }
     v
 }
 
-/// Build one request from the tape, planned against live state.
+const SETTLE: &[&str] = &["resolved", "rejected", "rejected_canceled"];
+const ADDRS: &[&str] = &["http://a/1", "https://b/2", "poll://c@d"];
+const TTLS: &[i64] = &[1, 5000, 60000];
+const CRONS: &[&str] = &["* * * * *", "0 * * * *", "*/5 * * * *"];
+
+fn one_of<'a>(t: &mut Tape, v: &[&'a str]) -> &'a str {
+    v[t.upto(v.len())]
+}
+fn one_i64(t: &mut Tape, v: &[i64]) -> i64 {
+    v[t.upto(v.len())]
+}
+fn pick_id(t: &mut Tape, v: &[&Row]) -> Option<(String, i32, String)> {
+    if v.is_empty() {
+        None
+    } else {
+        let r = v[t.upto(v.len())];
+        Some((r.id.clone(), r.version, r.pid.clone().unwrap_or_default()))
+    }
+}
+
 fn plan(t: &mut Tape, l: &Live, now: i64) -> Option<(String, Value)> {
     let target = if t.byte() % 4 == 0 { "g2" } else { "g1" };
     let elig = eligible(l);
-    // One byte in eight ignores eligibility, so the reject paths stay covered —
-    // a fuzzer that only ever sends valid requests never tests a guard.
+    // One byte in eight ignores eligibility, so the reject paths stay covered.
     let op = if t.byte() % 8 == 0 {
         OPS[t.upto(OPS.len())]
     } else {
         elig[t.upto(elig.len())]
     };
-    let new_id = || -> String {
-        // `foo.N` is a root and its own origin, `foo.N:M` a child of it.
-        format!("foo.{}", 0)
-    };
+    let fallback = || ("foo.0".to_string(), 0i32, "w0".to_string());
     let d = match op {
         "promise.create" => {
             let root = format!("foo.{}", t.upto(6));
@@ -322,13 +432,10 @@ fn plan(t: &mut Tape, l: &Live, now: i64) -> Option<(String, Value)> {
             } else {
                 root.clone()
             };
-            // Each tag is rolled INDEPENDENTLY. An earlier version used a
-            // match, which made timer and target mutually exclusive — and a
-            // deliberately broken store that accepted `Tags.timerTargeted` then
-            // survived a full run, because the generator could not express the
-            // input that refutes it. A fuzzer that cannot produce the witness
-            // passes vacuously, which is the failure mode the specification
-            // repo's own fuzzer guards against by mutating known-good traces.
+            // Each tag is rolled INDEPENDENTLY. An earlier version used a match,
+            // which made timer and target mutually exclusive — and a store with
+            // the timerTargeted guard removed then survived a whole run, because
+            // the witness was inexpressible.
             let mut tags = json!({ "resonate:origin": id.split(':').next().unwrap() });
             if t.byte() % 3 == 0 {
                 tags["resonate:timer"] = json!("true");
@@ -345,70 +452,74 @@ fn plan(t: &mut Tape, l: &Live, now: i64) -> Option<(String, Value)> {
             json!({ "id": id, "timeoutAt": now + (t.word() as i64) * 10,
                     "param": { "headers": {}, "data": null }, "tags": tags })
         }
-        "promise.get" => json!({ "id": pick(t, &l.all_promises).unwrap_or_else(new_id) }),
-        "promise.settle" => json!({
-            "id": pick(t, &l.pending_promises).unwrap_or_else(new_id),
-            "state": one_of(t, SETTLE),
-            "value": { "headers": {}, "data": "v" } }),
-        "promise.register_callback" => {
-            let awaited = pick(t, &l.pending_targeted).unwrap_or_else(new_id);
-            let awaiter = pick(t, &l.pending_targeted).unwrap_or_else(new_id);
-            json!({ "awaited": awaited, "awaiter": awaiter })
+        "promise.get" => {
+            let (id, _, _) = pick_id(t, &l.rows.iter().collect::<Vec<_>>()).unwrap_or_else(fallback);
+            json!({ "id": id })
         }
-        "promise.register_listener" => json!({
-            "awaited": pick(t, &l.pending_promises).unwrap_or_else(new_id),
-            "address": one_of(t, ADDRS) }),
+        "promise.settle" => {
+            let (id, _, _) = pick_id(t, &l.pending_promises()).unwrap_or_else(fallback);
+            json!({ "id": id, "state": one_of(t, SETTLE),
+                    "value": { "headers": {}, "data": "v" } })
+        }
+        "promise.register_callback" => {
+            let (a, _, _) = pick_id(t, &l.pending_targeted()).unwrap_or_else(fallback);
+            let (b, _, _) = pick_id(t, &l.pending_targeted()).unwrap_or_else(fallback);
+            json!({ "awaited": a, "awaiter": b })
+        }
+        "promise.register_listener" => {
+            let (id, _, _) = pick_id(t, &l.pending_promises()).unwrap_or_else(fallback);
+            json!({ "awaited": id, "address": one_of(t, ADDRS) })
+        }
         "task.create" => {
             let root = format!("foo.{}", t.upto(6));
             let ttl = one_i64(t, TTLS);
+            let tags = if t.byte() % 4 == 0 {
+                json!({ "resonate:target": target, "resonate:origin": root,
+                        "resonate:timer": "true" })
+            } else {
+                json!({ "resonate:target": target, "resonate:origin": root })
+            };
             json!({ "pid": format!("w{}", t.upto(3)), "ttl": ttl,
-                    "action": { "data": {
-                        "id": root, "timeoutAt": now + (t.word() as i64) * 10,
-                        "param": { "headers": {}, "data": null },
-                        "tags": if t.byte() % 4 == 0 {
-                            json!({ "resonate:target": target, "resonate:origin": root,
-                                    "resonate:timer": "true" })
-                        } else {
-                            json!({ "resonate:target": target, "resonate:origin": root })
-                        } } } })
+                    "action": { "data": { "id": root,
+                        "timeoutAt": now + (t.word() as i64) * 10,
+                        "param": { "headers": {}, "data": null }, "tags": tags } } })
         }
-        "task.get" => json!({ "id": pick(t, &l.all_promises).unwrap_or_else(new_id) }),
+        "task.get" => {
+            let (id, _, _) = pick_id(t, &l.rows.iter().collect::<Vec<_>>()).unwrap_or_else(fallback);
+            json!({ "id": id })
+        }
         "task.acquire" => {
-            // The whole reason for planning: id AND its current version.
-            let (id, v) = pick(t, &l.pending_tasks).unwrap_or_else(|| (new_id(), 0));
+            let (id, v, _) = pick_id(t, &l.by_task("pending")).unwrap_or_else(fallback);
             let ttl = one_i64(t, TTLS);
-            json!({ "id": id, "version": v, "pid": format!("w{}", t.upto(3)),
-                    "ttl": ttl })
+            // one byte in four names a WRONG version, to keep the fence covered
+            let v = if t.byte() % 4 == 0 { v + 1 } else { v };
+            json!({ "id": id, "version": v, "pid": format!("w{}", t.upto(3)), "ttl": ttl })
         }
         "task.release" => {
-            let (id, v, _) = pick(t, &l.acquired_tasks).unwrap_or_else(|| (new_id(), 0, String::new()));
+            let (id, v, _) = pick_id(t, &l.by_task("acquired")).unwrap_or_else(fallback);
+            let v = if t.byte() % 4 == 0 { v + 1 } else { v };
             json!({ "id": id, "version": v })
         }
         "task.fulfill" => {
-            let (id, v, _) = pick(t, &l.acquired_tasks).unwrap_or_else(|| (new_id(), 0, String::new()));
+            let (id, v, _) = pick_id(t, &l.by_task("acquired")).unwrap_or_else(fallback);
             let st = one_of(t, SETTLE);
             json!({ "id": id, "version": v, "action": { "data": {
-                "id": id, "state": st,
-                "value": { "headers": {}, "data": "r" } } } })
+                "id": id, "state": st, "value": { "headers": {}, "data": "r" } } } })
         }
         "task.suspend" => {
-            let (id, v, _) = pick(t, &l.acquired_tasks).unwrap_or_else(|| (new_id(), 0, String::new()));
-            let n = 1 + t.upto(3);
+            let (id, v, _) = pick_id(t, &l.by_task("acquired")).unwrap_or_else(fallback);
+            let n = t.upto(4); // 0 is legal input and must be refused
             let mut actions = vec![];
-            let mut seen: Vec<String> = vec![];
             for _ in 0..n {
-                if let Some(a) = pick(t, &l.pending_targeted) {
-                    if a != id && !seen.contains(&a) {
-                        seen.push(a.clone());
-                        actions.push(json!({ "data": { "awaited": a } }));
-                    }
+                if let Some((a, _, _)) = pick_id(t, &l.pending_targeted()) {
+                    actions.push(json!({ "data": { "awaited": a } }));
                 }
             }
             json!({ "id": id, "version": v, "actions": actions })
         }
         "task.fence" => {
-            let (id, v, _) = pick(t, &l.acquired_tasks).unwrap_or_else(|| (new_id(), 0, String::new()));
-            let other = pick(t, &l.pending_promises).unwrap_or_else(new_id);
+            let (id, v, _) = pick_id(t, &l.by_task("acquired")).unwrap_or_else(fallback);
+            let (other, _, _) = pick_id(t, &l.pending_promises()).unwrap_or_else(fallback);
             if t.byte() % 2 == 0 {
                 json!({ "id": id, "version": v, "action": { "kind": "promise.settle",
                     "data": { "id": other, "state": "resolved",
@@ -422,61 +533,43 @@ fn plan(t: &mut Tape, l: &Live, now: i64) -> Option<(String, Value)> {
             }
         }
         "task.heartbeat" => {
-            let (id, v, pid) = pick(t, &l.acquired_tasks)
-                .unwrap_or_else(|| (new_id(), 0, "w0".into()));
+            let (id, v, pid) = pick_id(t, &l.by_task("acquired")).unwrap_or_else(fallback);
             json!({ "pid": pid, "tasks": [{ "id": id, "version": v }] })
         }
         "task.halt" => {
-            let mut c: Vec<String> = l.suspended.clone();
-            c.extend(l.pending_tasks.iter().map(|(i, _)| i.clone()));
-            c.extend(l.acquired_tasks.iter().map(|(i, _, _)| i.clone()));
-            json!({ "id": pick(t, &c).unwrap_or_else(new_id) })
+            let mut c: Vec<&Row> = l.by_task("suspended");
+            c.extend(l.by_task("pending"));
+            c.extend(l.by_task("acquired"));
+            let (id, _, _) = pick_id(t, &c).unwrap_or_else(fallback);
+            json!({ "id": id })
         }
-        "task.continue" => json!({ "id": pick(t, &l.halted).unwrap_or_else(new_id) }),
+        "task.continue" => {
+            let (id, _, _) = pick_id(t, &l.by_task("halted")).unwrap_or_else(fallback);
+            json!({ "id": id })
+        }
         "schedule.create" => json!({
-            "id": format!("s{}", t.upto(3)),
-            "cron": one_of(t, CRONS),
+            "id": format!("s{}", t.upto(3)), "cron": one_of(t, CRONS),
             "promiseId": "sp.{{.id}}.{{.timestamp}}", "promiseTimeout": 60000,
             "promiseParam": { "headers": {}, "data": null }, "promiseTags": {} }),
-        "schedule.get" => json!({ "id": pick(t, &l.schedules)
-            .unwrap_or_else(|| format!("s{}", t.upto(3))) }),
-        "schedule.delete" => json!({ "id": pick(t, &l.schedules)
-            .unwrap_or_else(|| format!("s{}", t.upto(3))) }),
+        "schedule.get" | "schedule.delete" => {
+            let id = if l.schedule_ids.is_empty() {
+                format!("s{}", t.upto(3))
+            } else {
+                l.schedule_ids[t.upto(l.schedule_ids.len())].clone()
+            };
+            json!({ "id": id })
+        }
         "tick" => json!({}),
         _ => unreachable!(),
     };
     Some((op.to_string(), d))
 }
 
-const SETTLE: &[&str] = &["resolved", "rejected", "rejected_canceled"];
-const ADDRS: &[&str] = &["http://a/1", "https://b/2", "poll://c@d"];
-const TTLS: &[i64] = &[1, 5000, 60000];
-const CRONS: &[&str] = &["* * * * *", "0 * * * *", "*/5 * * * *"];
-
-fn one_of<'a>(t: &mut Tape, v: &[&'a str]) -> &'a str {
-    v[t.upto(v.len())]
-}
-
-fn one_i64(t: &mut Tape, v: &[i64]) -> i64 {
-    v[t.upto(v.len())]
-}
-
-fn pick<T: Clone>(t: &mut Tape, v: &[T]) -> Option<T> {
-    if v.is_empty() {
-        None
-    } else {
-        Some(v[t.upto(v.len())].clone())
-    }
-}
-
 // ─── productivity counters ───────────────────────────────────────────────────
-// The planner exists to make requests LAND. Counting how often each operation
-// reaches a 2xx is the check on whether it does — the blind generator in
-// `test/differential.py` is the control, and it sits at 0.7% on task.acquire.
 
 static mut OP_TOTAL: [u64; 32] = [0; 32];
 static mut OP_OK: [u64; 32] = [0; 32];
-static mut PROGRAMS: u64 = 0;
+static mut EXECS: u64 = 0;
 
 fn count(op_idx: usize, ok: bool) {
     unsafe {
@@ -491,14 +584,9 @@ fn count(op_idx: usize, ok: bool) {
 
 fn dump_counts() {
     unsafe {
-        let p = (&raw mut PROGRAMS) as *mut u64;
-        *p += 1;
-        if *p % 250 != 0 {
-            return;
-        }
         let t = (&raw const OP_TOTAL) as *const u64;
         let k = (&raw const OP_OK) as *const u64;
-        eprintln!("\n[planner] after {} programs — share of each op reaching 2xx/3xx:", *p);
+        eprintln!("[planner] share of each op reaching 2xx/3xx:");
         for (i, op) in OPS.iter().enumerate() {
             let tot = *t.add(i);
             if tot == 0 {
@@ -520,17 +608,14 @@ fn rpc(c: &mut Client, kind: &str, data: &Value, now: i64) -> Result<Value, post
     Ok(row.get(0))
 }
 
-/// Status is the contract; the error phrase is not — the two stores word their
-/// 4xx differently and always have.
 fn canon(v: &Value) -> Value {
     let status = v.pointer("/head/status").cloned().unwrap_or(Value::Null);
-    let d = v.get("data");
     let s = status.as_i64().unwrap_or(0);
     if s != 200 && s != 300 {
         return json!({ "status": status });
     }
     let mut out = json!({ "status": status });
-    if let Some(d) = d.and_then(|d| d.as_object()) {
+    if let Some(d) = v.get("data").and_then(|d| d.as_object()) {
         for k in ["promise", "task", "schedule", "action"] {
             if let Some(v) = d.get(k) {
                 out[k] = v.clone();
@@ -549,7 +634,12 @@ struct Finding {
     why: &'static str,
 }
 
-fn run_program(two: &mut Client, one: &mut Client, tape: &[u8]) -> Option<Finding> {
+fn run_program(
+    two: &mut Client,
+    one: &mut Client,
+    tape: &[u8],
+    fb: Feedback,
+) -> Option<Finding> {
     const RESET_TWO: &str = "TRUNCATE resonate.outbox, resonate.listeners, resonate.callbacks, \
          resonate.task_resumes, resonate.tasks, resonate.schedules, resonate.promises CASCADE";
     const RESET_ONE: &str =
@@ -558,10 +648,10 @@ fn run_program(two: &mut Client, one: &mut Client, tape: &[u8]) -> Option<Findin
         return None;
     }
 
-    dump_counts();
     let mut t = Tape::new(tape);
     let mut now: i64 = 1_000_000_000;
     let mut step = 0usize;
+    let mut prev: u64 = 0; // AFL's prev_location
 
     while !t.done() && step < 128 {
         now += [0i64, 1, 10, 250, 3_000, 7_000][t.upto(6)];
@@ -579,9 +669,9 @@ fn run_program(two: &mut Client, one: &mut Client, tape: &[u8]) -> Option<Findin
             let a = two.execute("SELECT resonate.process_timeouts($1)", &[&now]);
             let b = one.execute("SELECT resonate.process_timeouts($1)", &[&now]);
             match (a, b) {
-                (Ok(_), Ok(_)) => (json!({"head":{"status":200}}), json!({"head":{"status":200}})),
-                // A raise from the sweep is a finding: the constrained store
-                // reached a state its catalogue forbids.
+                (Ok(_), Ok(_)) => {
+                    (json!({"head":{"status":200}}), json!({"head":{"status":200}}))
+                }
                 _ => {
                     return Some(Finding { step, kind, data, two: json!("sweep"),
                                           one: json!("sweep raised"), why: "tick raised" })
@@ -599,16 +689,25 @@ fn run_program(two: &mut Client, one: &mut Client, tape: &[u8]) -> Option<Findin
         let op_i = OPS.iter().position(|o| *o == kind).unwrap_or(0);
         count(op_i, s1 == 200 || s1 == 300);
 
-        // ── FEEDBACK: one signature per step into the custom bitmap ──────────
-        let sh = shape(one).unwrap_or(0);
-        let op_idx = OPS.iter().position(|o| *o == kind).unwrap_or(0) as u64;
-        let sig = mix(mix(mix(0, op_idx), s1 as u64), sh);
-        signal((sig % MAP_SIZE as u64) as usize);
+        // ── FEEDBACK ────────────────────────────────────────────────────────
+        let mut cur = mix(mix(0, op_i as u64), s1 as u64);
+        cur = mix(cur, match fb {
+            Feedback::Shapes => shape_per_object(&live),
+            _ => shape_aggregate(&live),
+        });
+        if fb == Feedback::Preconds || fb == Feedback::Shapes {
+            cur = mix(cur, preconds(&live, &kind, &data, now));
+        }
+        let idx = match fb {
+            // Points: the step alone. Edges and above: the step in the context
+            // of the one before it, which is AFL's whole trick.
+            Feedback::Points => cur,
+            _ => mix(prev, cur),
+        };
+        signal((idx % MAP_SIZE as u64) as usize);
+        prev = cur >> 1;
 
         // ── OBJECTIVE ───────────────────────────────────────────────────────
-        // A 500 from the constrained store is a catalogue violation: the CHECK
-        // raised and resonate_rpc's exception arm turned it into a 500. This is
-        // the finding two agreeing stores could never give you.
         if s1 == 500 || s2 == 500 {
             return Some(Finding { step, kind, data, two: r2, one: r1,
                                   why: "internal error / constraint violation" });
@@ -622,6 +721,13 @@ fn run_program(two: &mut Client, one: &mut Client, tape: &[u8]) -> Option<Findin
 }
 
 fn main() {
+    let fb = Feedback::from_env();
+    let max_execs: u64 = std::env::var("FUZZ_MAX_EXECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let quiet = std::env::var("FUZZ_QUIET").is_ok();
+
     let two_dsn = std::env::var("FUZZ_TWO")
         .unwrap_or_else(|_| "host=/tmp port=5433 user=postgres dbname=res_fuzz_two".into());
     let one_dsn = std::env::var("FUZZ_ONE")
@@ -632,34 +738,53 @@ fn main() {
 
     let findings_dir = PathBuf::from("./findings");
     std::fs::create_dir_all(&findings_dir).ok();
-    let mut found = 0usize;
+
+    eprintln!("[fuzz] feedback={} max_execs={}", fb.name(), max_execs);
 
     let mut harness = |input: &BytesInput| {
         let bytes = input.target_bytes();
         clear_map();
-        match run_program(&mut two, &mut one, &bytes) {
-            None => ExitKind::Ok,
+        let n = unsafe {
+            let p = (&raw mut EXECS) as *mut u64;
+            *p += 1;
+            *p
+        };
+        let r = run_program(&mut two, &mut one, &bytes, fb);
+        match r {
             Some(f) => {
-                found += 1;
-                let report = json!({
-                    "why": f.why, "step": f.step, "op": f.kind, "request": f.data,
-                    "two_table": f.two, "single_table": f.one,
-                    "tape": bytes.iter().map(|b| *b as u32).collect::<Vec<_>>(),
-                });
-                let path = findings_dir.join(format!("finding-{found:04}.json"));
-                std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).ok();
-                eprintln!("\n[FINDING {found}] {} at step {} on {}\n  {}\n",
-                          f.why, f.step, f.kind, path.display());
-                ExitKind::Crash
+                // The measurement the battery reads: how many executions until
+                // the objective fired.
+                println!("RESULT found=1 execs={} feedback={} why={} op={}",
+                         n, fb.name(), f.why, f.kind);
+                if !quiet {
+                    let report = json!({
+                        "why": f.why, "step": f.step, "op": f.kind, "request": f.data,
+                        "two_table": f.two, "single_table": f.one,
+                        "execs": n, "feedback": fb.name(),
+                    });
+                    std::fs::write(findings_dir.join("finding.json"),
+                                   serde_json::to_string_pretty(&report).unwrap()).ok();
+                    dump_counts();
+                }
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                std::process::exit(0);
+            }
+            None => {
+                if max_execs > 0 && n >= max_execs {
+                    println!("RESULT found=0 execs={} feedback={}", n, fb.name());
+                    if !quiet {
+                        dump_counts();
+                    }
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    std::process::exit(0);
+                }
+                ExitKind::Ok
             }
         }
     };
 
     let observer = unsafe { StdMapObserver::new("signatures", &mut *(&raw mut SIGNALS)) };
-
-    // FEEDBACK — corpus membership. A new maximum in any signature bucket.
     let mut feedback = MaxMapFeedback::new(&observer);
-    // OBJECTIVE — findings. Divergence, reported as a crash by the harness.
     let mut objective = CrashFeedback::new();
 
     let mut state = StdState::new(
@@ -671,7 +796,11 @@ fn main() {
     )
     .unwrap();
 
-    let mon = SimpleMonitor::new(|s| println!("{s}"));
+    let mon = SimpleMonitor::new(move |s| {
+        if !quiet {
+            println!("{s}");
+        }
+    });
     let mut mgr = SimpleEventManager::new(mon);
     let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
